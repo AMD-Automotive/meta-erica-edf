@@ -1,0 +1,9 @@
+[Unit]
+Description=Boot script to resize SD card
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/resize-sd.sh
+
+[Install]
+WantedBy=multi-user.target

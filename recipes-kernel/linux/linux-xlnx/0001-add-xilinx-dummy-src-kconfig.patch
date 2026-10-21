@@ -1,0 +1,27 @@
+From 80c126ac11e16fa6565374652899d5de6fd39f2f Mon Sep 17 00:00:00 2001
+From: Kris Chaplin <kris.chaplin@amd.com>
+Date: Mon, 19 Jan 2026 11:36:12 +0000
+Subject: [PATCH] Add Xilinx dummy src kconfig
+
+Signed-off-by: Kris Chaplin <kris.chaplin@amd.com>
+---
+ drivers/media/platform/xilinx/Kconfig | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/drivers/media/platform/xilinx/Kconfig b/drivers/media/platform/xilinx/Kconfig
+index 660a41d53304..8a50edafb1eb 100644
+--- a/drivers/media/platform/xilinx/Kconfig
++++ b/drivers/media/platform/xilinx/Kconfig
+@@ -197,3 +197,9 @@ config VIDEO_XILINX_AXI4S_SUBSETCONV
+ 	  mapped in this driver.
+ 	  To compile this driver as a module, choose M here.
+ 	  If unsure, choose N
++
++config VIDEO_XILINX_DUMMY_SRC
++       tristate "Xilinx Dummy Source"
++       depends on VIDEO_DEV && MEDIA_SUPPORT
++       help
++         Enable the Xilinx dummy source driver.
+-- 
+2.44.4
+

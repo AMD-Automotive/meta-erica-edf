@@ -1,0 +1,11 @@
+# mkimage -A arm -O linux -T script -C none -n "VEK385 DT Overlay logic" -d /boot/VEK385.txt /boot/VEK385.scr
+
+echo "******************************************************"
+echo "**** Overlaying device tree to enable big npu mem ****"
+echo "******************************************************"
+echo "To disable big npu mem, rename /boot/VEK385.scr and reboot"
+
+fdt set /reserved-memory/shared_dma_mem_region linux,cma-default;
+fdt set /chosen bootargs "earlycon=pl011,mmio32,0xf1930000 console=ttyAMA0,115200";
+fdt set /chosen dom0_bootargs "console=hvc0 earlycon=xen earlyprintk=xen clk_ignore_unused";
+fdt rm /amba_pl/ald3xx memory-region;

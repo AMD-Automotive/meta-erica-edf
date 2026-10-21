@@ -1,0 +1,33 @@
+# Copyright © Advanced Micro Devices, Inc., or its affiliates. All rights reserved.
+# SPDX-License-Identifier: MIT
+# Contributors: KC
+# Maintainer: KC
+
+# Description: Fixed-geometry partitioned image for RAVE2 UFS, with a persistent
+# /data partition that buddy can exclude when updating boot/root.
+#
+# Every partition is aligned to and sized in whole 128MiB units so that each of
+# buddy's 128MiB transfer chunks belongs to exactly one partition. Do not change
+# --align or use a --fixed-size that is not a multiple of 128MiB without bumping
+# the -v1 suffix in --part-name; buddy keys its "safe to preserve /data" check on
+# that name plus the partition start/size.
+#
+# /boot and / are fixed so the artifact stays small enough for CI runners. /data
+# ships at 256MiB and is grown to fill the media on first boot by resize-sd. The
+# 256MiB floor is deliberate: mke2fs sizes the resize inode from the initial
+# filesystem, giving a ~496GiB online-resize ceiling here, whereas a 128MiB start
+# would cap at ~240GiB -- barely above the 238GiB LUN.
+#
+# Consequence for buddy: after first boot the target's GPT legitimately differs
+# from the image's in /data's size, so an update must preserve the on-target
+# table rather than writing the image's.
+#
+#   128MiB  GPT + alignment gap (chunk 0)
+#   512MiB  /boot   vfat
+#    16GiB  /        ext4
+#   256MiB  /data   ext4   <- grown on first boot, preserved across updates
+bootloader --ptable gpt
+# Keep FAT logical sector size at 512B for U-Boot filesystem loader compatibility.
+part  /boot  --source rootfs --change-directory=boot  --fixed-size=512M   --fstype=vfat  --mkfs-extraopts "-F 32 -S 512"  --use-label  --label dom0boot  --part-name boot-v1  --align 131072  --uuid 377ecac0-4852-11f0-84d2-325096b39f47
+part  /      --source rootfs --exclude-path=boot/                         --fixed-size=16384M  --fstype=ext4  --use-label  --label root  --part-name root-v1  --align 131072  --uuid 377ec80e-4852-11f0-9688-325096b39f47
+part  /data                                                               --fixed-size=256M    --fstype=ext4  --use-label  --label data  --part-name data-v1  --align 131072  --uuid dae04865-3219-4ea1-9784-2f0eb7677bd7  --fsoptions "defaults,nofail,x-systemd.device-timeout=10"

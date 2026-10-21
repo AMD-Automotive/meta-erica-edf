@@ -1,0 +1,7 @@
+SPDX-FileCopyrightText: Copyright © Advanced Micro Devices, Inc., or its affiliates. All rights reserved.
+SPDX-FileContributor: LT
+# Maintainer: LT
+# Provenance: AMD-authored modification to the Xilinx VCU2 kernel module
+# Owning recipe license: GPL-2.0-only
+
+SPDX-License-Identifier: GPL-2.0-only

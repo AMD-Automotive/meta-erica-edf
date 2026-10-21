@@ -1,0 +1,34 @@
+#!/bin/sh
+# Copyright © Advanced Micro Devices, Inc., or its affiliates. All rights reserved.
+# SPDX-License-Identifier: MIT
+# Contributors: TO
+# Maintainer: TO
+
+echo "Configuring Cameras"
+echo "==================="
+
+echo "Reading /etc/PLF_MODE"
+if [ -f /etc/PLF_MODE ]; then
+        camera_mode=$(cat /etc/PLF_MODE)
+        pushd /usr/share/plf-vek385
+
+        if [[ "${camera_mode}" == "SIMULATOR" ]]; then
+                echo "Simulator mode"
+                video_config --xml_path conf_sim_vek385_4cam.xml
+        elif  [[ "${camera_mode}" == "OLD_FIRMWARE" ]]; then
+                echo "Old PLF Firmware"
+                video_config --xml_path conf_vek385_live_oldcam.xml
+        elif [[ "${camera_mode}" == "NEW_FIRMWARE" ]]; then
+                echo "New PLF Firmware"
+                video_config --xml_path conf_vek385_live_newcam.xml
+        elif [[ "${camera_mode}" == "NO_PLF" ]]; then
+                echo "Not loading PLF Firmware"
+        else
+                echo "Unrecognised value ${camera_mode}"
+        fi
+
+        popd
+else
+        echo "Error - /etc/PLF_MODE does not exist - autostart may have failed"
+fi
+

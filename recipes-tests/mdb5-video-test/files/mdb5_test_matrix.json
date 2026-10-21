@@ -1,0 +1,52 @@
+{
+  "test_cases": [
+    {"name": "1ch_rgb24_vga_sp",        "n_channels": 1, "width": 640,  "height": 480,  "format": "RGB24",  "multiplanar": false, "fps": 30, "capture_modes": ["mmap"]},
+    {"name": "1ch_rgbx32_vga_sp",       "n_channels": 1, "width": 640,  "height": 480,  "format": "RGBX32", "multiplanar": false, "fps": 30, "capture_modes": ["mmap"]},
+    {"name": "1ch_bgr24_vga_sp",        "n_channels": 1, "width": 640,  "height": 480,  "format": "BGR24",  "multiplanar": false, "fps": 30, "capture_modes": ["mmap"]},
+    {"name": "1ch_bgrx32_vga_sp",       "n_channels": 1, "width": 640,  "height": 480,  "format": "BGRX32", "multiplanar": false, "fps": 30, "capture_modes": ["mmap"]},
+    {"name": "1ch_yuyv_vga_sp",         "n_channels": 1, "width": 640,  "height": 480,  "format": "YUYV",   "multiplanar": false, "fps": 30, "capture_modes": ["mmap"]},
+    {"name": "1ch_uyvy_vga_sp",         "n_channels": 1, "width": 640,  "height": 480,  "format": "UYVY",   "multiplanar": false, "fps": 30, "capture_modes": ["mmap"]},
+    {"name": "1ch_nv12_vga_sp",         "n_channels": 1, "width": 640,  "height": 480,  "format": "NV12",   "multiplanar": false, "fps": 30, "capture_modes": ["mmap"]},
+
+    {"name": "1ch_rgb24_1080p_sp",      "n_channels": 1, "width": 1920, "height": 1080, "format": "RGB24",  "multiplanar": false, "fps": 30, "capture_modes": ["mmap"]},
+    {"name": "1ch_uyvy_1080p_sp",       "n_channels": 1, "width": 1920, "height": 1080, "format": "UYVY",   "multiplanar": false, "fps": 30, "capture_modes": ["mmap"]},
+    {"name": "1ch_nv12_1080p_sp",       "n_channels": 1, "width": 1920, "height": 1080, "format": "NV12",   "multiplanar": false, "fps": 30, "capture_modes": ["mmap"]},
+
+    {"name": "1ch_uyvy_1928x1208_sp",   "n_channels": 1, "width": 1928, "height": 1208, "format": "UYVY",   "multiplanar": false, "fps": 30, "capture_modes": ["mmap"]},
+    {"name": "1ch_uyvy_1920x1536_sp",   "n_channels": 1, "width": 1920, "height": 1536, "format": "UYVY",   "multiplanar": false, "fps": 30, "capture_modes": ["mmap"]},
+    {"name": "1ch_uyvy_4k_sp",          "n_channels": 1, "width": 3840, "height": 2160, "format": "UYVY",   "multiplanar": false, "fps": 30, "capture_modes": ["mmap"]},
+    {"name": "1ch_rgbx32_4k_sp",        "n_channels": 1, "width": 3840, "height": 2160, "format": "RGBX32", "multiplanar": false, "fps": 30, "capture_modes": ["mmap"]},
+
+    {"name": "1ch_uyvy_1080p_mp",       "n_channels": 1, "width": 1920, "height": 1080, "format": "UYVY",   "multiplanar": true,  "fps": 30, "capture_modes": ["mmap"]},
+    {"name": "1ch_nv12_1080p_mp",       "n_channels": 1, "width": 1920, "height": 1080, "format": "NV12",   "multiplanar": true,  "fps": 30, "capture_modes": ["mmap"]},
+    {"name": "1ch_rgbx32_1080p_mp",     "n_channels": 1, "width": 1920, "height": 1080, "format": "RGBX32", "multiplanar": true,  "fps": 30, "capture_modes": ["mmap"]},
+
+    {"name": "2ch_uyvy_1080p_sp",       "n_channels": 2, "width": 1920, "height": 1080, "format": "UYVY",   "multiplanar": false, "fps": 30, "capture_modes": ["mmap"]},
+    {"name": "4ch_uyvy_1080p_sp",       "n_channels": 4, "width": 1920, "height": 1080, "format": "UYVY",   "multiplanar": false, "fps": 30, "capture_modes": ["mmap"]},
+    {"name": "4ch_uyvy_1928x1208_sp",   "n_channels": 4, "width": 1928, "height": 1208, "format": "UYVY",   "multiplanar": false, "fps": 30, "capture_modes": ["mmap"]},
+    {"name": "4ch_uyvy_1928x1208_mp",   "n_channels": 4, "width": 1928, "height": 1208, "format": "UYVY",   "multiplanar": true,  "fps": 30, "capture_modes": ["mmap"]},
+    {"name": "4ch_nv12_1928x1208_sp",   "n_channels": 4, "width": 1928, "height": 1208, "format": "NV12",   "multiplanar": false, "fps": 30, "capture_modes": ["mmap"]},
+    {"name": "4ch_nv12_1928x1208_mp",   "n_channels": 4, "width": 1928, "height": 1208, "format": "NV12",   "multiplanar": true,  "fps": 30, "capture_modes": ["mmap"]},
+    {"name": "4ch_uyvy_1920x1536_sp",   "n_channels": 4, "width": 1920, "height": 1536, "format": "UYVY",   "multiplanar": false, "fps": 30, "capture_modes": ["mmap"]},
+    {"name": "4ch_nv12_1920x1536_sp",   "n_channels": 4, "width": 1920, "height": 1536, "format": "NV12",   "multiplanar": false, "fps": 30, "capture_modes": ["mmap"]},
+    {"name": "4ch_nv12_1080p_sp",       "n_channels": 4, "width": 1920, "height": 1080, "format": "NV12",   "multiplanar": false, "fps": 30, "capture_modes": ["mmap"]},
+
+    {
+      "name": "mixed_4ch_nv12_1920x1536_1ch_rgb24_4k",
+      "n_channels": 5,
+      "mixed": true,
+      "channels": [
+        {"width": 1920, "height": 1536, "format": "NV12"},
+        {"width": 1920, "height": 1536, "format": "NV12"},
+        {"width": 1920, "height": 1536, "format": "NV12"},
+        {"width": 1920, "height": 1536, "format": "NV12"},
+        {"width": 3840, "height": 2160, "format": "RGB24"}
+      ],
+      "multiplanar": false,
+      "fps": 30,
+      "capture_modes": ["mmap"]
+    },
+
+    {"name": "5ch_nv12_1920x1536_sp",   "n_channels": 5, "width": 1920, "height": 1536, "format": "NV12",   "multiplanar": false, "fps": 30, "capture_modes": ["mmap"]}
+  ]
+}

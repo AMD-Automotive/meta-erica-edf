@@ -1,0 +1,30 @@
+From c5cf22b4914e0084feae5a15cc82e474dfb5eb7f Mon Sep 17 00:00:00 2001
+From: Kris Chaplin <kris.chaplin@amd.com>
+Date: Thu, 29 Jan 2026 11:09:14 +0000
+Subject: [PATCH] Restrict dtb to a third (vs a quarter)
+
+Signed-off-by: Kris Chaplin <kris.chaplin@amd.com>
+---
+ Makefile                      | 6 +++---
+ 1 files changed
+
+diff --git a/Makefile b/Makefile
+index 3334d97fffe..71154dacd98 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1339,9 +1339,9 @@ init_sp_bss_offset_check: u-boot.dtb FORCE
+ 	@dtb_size=$(shell wc -c u-boot.dtb | awk '{print $$1}') ; \
+ 	space=$(CONFIG_SYS_INIT_SP_BSS_OFFSET) ; \
+ 	$(subtract_sys_malloc_f_len) ; \
+-	quarter_space=$$(($${space} / 4)) ; \
+-	if [ $${dtb_size} -gt $${quarter_space} ]; then \
+-		echo "u-boot.dtb is larger than 1 quarter of " >&2 ; \
++	third_space=$$(($${space} / 3)) ; \
++	if [ $${dtb_size} -gt $${third_space} ]; then \
++		echo "u-boot.dtb is larger than 1 third of " >&2 ; \
+ 		echo "(CONFIG_SYS_INIT_SP_BSS_OFFSET - CONFIG_SYS_MALLOC_F_LEN)" >&2 ; \
+ 		exit 1 ; \
+ 	fi
+-- 
+2.44.4
+

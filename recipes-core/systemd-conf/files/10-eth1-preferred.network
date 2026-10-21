@@ -1,0 +1,14 @@
+# Make eth1 (10G) the preferred interface for default routing.
+# This overrides the default 80-wired.network (RouteMetric=10) by
+# matching eth1 first with a lower metric, so eth1 routes are preferred.
+
+[Match]
+Name=eth1
+
+[Network]
+DHCP=yes
+
+[DHCP]
+UseMTU=yes
+RouteMetric=5
+ClientIdentifier=mac

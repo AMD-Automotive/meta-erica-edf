@@ -1,0 +1,91 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+Copyright © Advanced Micro Devices, Inc., or its affiliates. All rights reserved.
+SPDX-License-Identifier: MIT
+Contributors: KC
+Maintainer: KC
+
+Camera pipeline composition for the AMD video_config tool. The Xylon register
+tables it references carry their own BSD-3-Clause notice.
+-->
+<Config>    
+
+    <Board name="FMC_GMSL2" type="BoardFmcGmsl2" i2cdev="/dev/i2c-0">
+
+        <Configuration type="inifile" conf="logiFMC_GMSL.ini"></Configuration >
+           <Device name="Deser1" type="Deser_MAX9296" i2caddr="0xD0">
+            <Configuration type="inifile" conf="Xylon_gmsl_deser_9296A.ini">
+                <Variables>
+                    <DESERIALIZER>0xD0</DESERIALIZER>
+                    <EXP_SEL_DESER>0x2</EXP_SEL_DESER>
+                    <VERBOSE>0</VERBOSE>
+                </Variables>
+            </Configuration >
+            
+            
+            <Configuration configPhase="postInit" type="initxt" conf="
+            slave-id DESERIALIZER  
+                0x0010, 0x03     // Select Link A">
+            </Configuration >   
+            
+            
+            <Device name="CAM0" type="logiCAM_GMSL2_AR023">
+                <Configuration type="inifile" conf="Xylon_gmsl_deser_linkA_new_fw.ini">
+                    <Variables>
+                        <SER_LOG>0x68</SER_LOG>
+                        <SER_SENS_LOG>0x08</SER_SENS_LOG>
+                        <SER_FPGA_LOG>0x28</SER_FPGA_LOG>
+                    </Variables>
+                </Configuration >
+            </Device>
+            
+			<Device name="CAM1" type="logiCAM_GMSL2_AR023">
+                <Configuration type="inifile" conf="Xylon_gmsl_deser_linkB_new_fw.ini">
+                    <Variables>
+                        <SER_LOG>0x6A</SER_LOG>
+                        <SER_SENS_LOG>0x0a</SER_SENS_LOG>
+                        <SER_FPGA_LOG>0x2a</SER_FPGA_LOG>
+                    </Variables>
+                </Configuration >
+            </Device>             
+        </Device>    
+    
+        <Device name="Deser2" type="Deser_MAX9296" i2caddr="0x94">
+            <Configuration type="inifile" conf="Xylon_gmsl_deser_9296A.ini">
+                <Variables>
+                    <DESERIALIZER>0x94</DESERIALIZER>
+                    <EXP_SEL_DESER>0xA</EXP_SEL_DESER>
+                    <VERBOSE>0</VERBOSE>                    
+                </Variables>
+            </Configuration >
+            
+            <Configuration configPhase="postInit" type="initxt" conf="
+            slave-id DESERIALIZER  
+               0x0010, 0x03     // Select Link A">
+            </Configuration >     
+
+            <Device name="CAM2" type="logiCAM_GMSL2_AR023">
+                <Configuration type="inifile" conf="Xylon_gmsl_deser_linkA_new_fw.ini">
+                    <Variables>
+                        <SER_LOG>0x6C</SER_LOG>
+                        <SER_SENS_LOG>0x0C</SER_SENS_LOG>
+                        <SER_FPGA_LOG>0x2C</SER_FPGA_LOG>
+                    </Variables>
+                </Configuration >
+            </Device>
+            
+            <Device name="CAM3" type="logiCAM_GMSL2_AR023">
+                <Configuration type="inifile" conf="Xylon_gmsl_deser_linkB_new_fw.ini">
+                    <Variables>
+                        <SER_LOG>0x6E</SER_LOG>
+                        <SER_SENS_LOG>0x0e</SER_SENS_LOG>
+                        <SER_FPGA_LOG>0x2E</SER_FPGA_LOG>
+                    </Variables>
+                </Configuration >
+            </Device> 
+
+        </Device> 
+        
+
+    </Board>
+</Config>

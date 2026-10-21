@@ -1,0 +1,46 @@
+From a1e5ea8fb7582781bd99308cbb40b4e1ab168ebe Mon Sep 17 00:00:00 2001
+From: erica <erica@amd.com>
+Date: Wed, 15 Jul 2026 17:57:52 -0400
+Subject: [PATCH] visp: skip DT-disabled upstream nodes in ISP async notifier
+
+On the ISP-Sentry BD the sensor pipeline (sensor -> MIPI CSI -> axis
+broadcaster) is managed by the R52 firmware and those PL blocks are
+status="disabled" in the DT.  visp_get_remote_parent_for_port() used
+of_graph_get_remote_port_parent(), which returns disabled remotes, so the
+disabled broadcaster was added to the ISP's async-notifier waiting_list.
+It never binds a v4l2 subdev, so notifier_complete never fires; that in
+turn blocks the chained visp_video notifier_complete, so no ISP subdev
+devnode and no pad links are ever created and the userspace media server
+fails MediaDeviceCreate.  Skip upstream nodes that are not available.
+---
+ visp/visp_driver.c | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/visp/visp_driver.c b/visp/visp_driver.c
+index ac61017..06587d4 100644
+--- a/visp/visp_driver.c
++++ b/visp/visp_driver.c
+@@ -1164,6 +1164,20 @@ static struct device_node *visp_get_remote_parent_for_port(struct device_node *n
+ 			continue;
+ 
+ 		remote = of_graph_get_remote_port_parent(ep);
++		/*
++		 * Skip upstream nodes disabled in the DT (e.g. the
++		 * axis-broadcaster on the ISP-Sentry BD, where the sensor
++		 * pipeline is R52-managed). of_graph_get_remote_port_parent()
++		 * returns disabled nodes; adding one to the ISP async notifier
++		 * waiting_list stalls notifier_complete forever (it never binds
++		 * a v4l2 subdev), which blocks visp_video's chained complete ->
++		 * no subdev devnode, no pad links, media server MediaDeviceCreate
++		 * fails.
++		 */
++		if (remote && !of_device_is_available(remote)) {
++			of_node_put(remote);
++			continue;
++		}
+ 		of_node_put(ep);
+ 		return remote;
+ 	}
+-- 
+2.43.0
+

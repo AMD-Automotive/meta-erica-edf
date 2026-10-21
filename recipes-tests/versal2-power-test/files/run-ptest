@@ -1,0 +1,14 @@
+#!/bin/sh
+# Copyright © Advanced Micro Devices, Inc., or its affiliates. All rights reserved.
+# SPDX-License-Identifier: MIT
+# Contributors: KC
+# Maintainer: KC
+
+python3 ./versal_power_check.py
+rc=$?
+
+if [ "$rc" = "77" ]; then
+    exit 77
+fi
+
+exit $rc

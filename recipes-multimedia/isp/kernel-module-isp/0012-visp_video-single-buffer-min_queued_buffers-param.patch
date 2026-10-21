@@ -1,0 +1,49 @@
+From: Jon Cory <jcory@amd.com>
+Date: Fri, 17 Jul 2026 22:30:00 -0400
+Subject: [PATCH] visp_video: expose vb2 min_queued_buffers as a module
+ parameter for single-buffer capture
+
+The visp-video vb2 capture queue hardcodes min_queued_buffers = 5, which
+forces REQBUFS(1) up to a 6-deep ring.  On the ERICA sentry ISP bridge the
+single-buffer path needs the ISP to write ONE carveout window so the erica
+RD-DMA (pinned at W0) reads the freshly written frame; the forced ring makes
+the ISP round-robin across windows the RD-DMA never reads -> green/stale tiles.
+
+Expose min_queued_buffers as a module parameter (default 0 = true single
+buffer) so the ring depth is tunable at runtime without a rebuild.
+
+Signed-off-by: Jon Cory <jcory@amd.com>
+---
+diff --git a/visp_video/visp_video_register.c b/visp_video/visp_video_register.c
+index c584d28..c7e90b4 100644
+--- a/visp_video/visp_video_register.c
++++ b/visp_video/visp_video_register.c
+@@ -2893,6 +2893,17 @@ static const struct vb2_ops visp_video_queue_ops = {
+ 	.stop_streaming = visp_video_vb2_stop_streaming,
+ };
+ 
++/* SINGLE-BUFFER support (ERICA sentry ISP-bridge).  vb2's default
++ * min_queued_buffers=5 forces REQBUFS(1) up to a 6-deep ring, so the ISP
++ * round-robins NV12 across windows the erica RD-DMA (pinned at W0) never
++ * reads -> green/stale tiles in single-buffer mode.  Expose it as a module
++ * parameter so the ring can be shrunk to a TRUE single buffer (0) at runtime
++ * without a rebuild.  Default 0 = single buffer. */
++static int visp_video_min_queued_buffers;
++module_param(visp_video_min_queued_buffers, int, 0644);
++MODULE_PARM_DESC(visp_video_min_queued_buffers,
++        "vb2 min_queued_buffers (0 = true single buffer; default 0)");
++
+ static int visp_video_queue_init(struct visp_video_dev *visp_vdev)
+ {
+ 	int ret = 0;
+@@ -2909,7 +2920,7 @@ static int visp_video_queue_init(struct visp_video_dev *visp_vdev)
+ 	queue->lock = &visp_vdev->video_lock;
+ 	queue->dev = visp_vdev->visp_mdev->dev;
+ 
+-	queue->min_queued_buffers = 5;
++	queue->min_queued_buffers = visp_video_min_queued_buffers;
+ 
+ 	ret = vb2_queue_init(queue);
+ 	if (ret) {
+-- 
+2.43.0

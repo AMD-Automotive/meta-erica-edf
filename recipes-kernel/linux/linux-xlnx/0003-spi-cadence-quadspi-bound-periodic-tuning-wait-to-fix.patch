@@ -1,0 +1,91 @@
+From f079e0abd33e7d11d5f59b031bed5630aeeafc68 Mon Sep 17 00:00:00 2001
+From: ERICA Sentry <root@amd-ecp>
+Date: Thu, 23 Jul 2026 00:00:00 -0700
+Subject: [PATCH] spi: cadence-quadspi: bound periodic-tuning wait (6.18) to
+ fix resume AB-BA deadlock
+
+Adapts the 2025.2 (kernel 6.12) fix to the 2026.1 kernel (6.18,
+xlnx_rebase_v6.18_LTS_2026.1), whose per-CS DLL-tuning rework restructured
+cqspi_periodictuning() but kept the same unbounded-wait / cancel hazard.
+
+An intermittent hang on deep-suspend resume (PSCI SYSTEM_SUSPEND) on Versal
+Gen 2 / VEK385 is a classic AB-BA deadlock between two D-state tasks:
+
+  (A) the resume/exec thread
+      ... -> spi_nor_resume -> spi_nor_init -> spi_nor_read_id
+          -> spi_mem_exec_op -> cqspi_exec_mem_op
+              refcount_inc(&cqspi->inflight_ops);
+          -> cqspi_setup_phymode()
+          -> cancel_delayed_work_sync(&mem->complete_work)
+          -> wait_for_completion()        [waits for the tuning work to end]
+
+  (B) the periodic-tuning work item
+      cqspi_periodictuning()
+          -> wait_for_completion(&mem->request_completion)
+                                          [waits for an in-flight mem op]
+
+(A) holds an in-flight OSPI mem op (request_completion not yet signalled)
+and waits to cancel the tuning work; (B) is that tuning work, parked forever
+on request_completion.  Neither can progress -> resume (and every async
+device resumer waiting on the QSPI parent) wedges.
+
+6.18 added an 'if (refcount_read(&cqspi->inflight_ops) > 1) reschedule'
+early-bail at the top of cqspi_periodictuning(), but that is a check-then-act
+guard: cqspi_exec_mem_op() only increments inflight_ops AFTER the periodic
+work may have already passed the guard, so the work can still enter the
+unbounded wait_for_completion(&mem->request_completion) while the exec path
+runs cancel_delayed_work_sync().  The window is small but is exactly the
+resume path that re-runs the setup/tuning code.
+
+Bound that wait with wait_for_completion_timeout(CQSPI_TUNING_TIMEOUT_MS).
+On timeout the work reschedules instead of holding off the
+cancel_delayed_work_sync() in the exec/resume path, so (A) is released
+(after at most CQSPI_TUNING_TIMEOUT_MS in the worst racing case) and the
+resume completes.  The existing '!request_completion.done' guard is
+preserved so an already-signalled completion is not consumed.  Both
+CQSPI_TUNING_TIMEOUT_MS and CQSPI_TUNING_PERIODICITY_MS are already defined
+and used in this driver.
+
+Signed-off-by: ERICA Sentry <root@amd-ecp>
+---
+ drivers/spi/spi-cadence-quadspi.c | 26 ++++++++++++++++++++++----
+ 1 file changed, 22 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/spi/spi-cadence-quadspi.c b/drivers/spi/spi-cadence-quadspi.c
+index 39f7834..8893c2a 100644
+--- a/drivers/spi/spi-cadence-quadspi.c
++++ b/drivers/spi/spi-cadence-quadspi.c
+@@ -975,11 +975,29 @@ static void cqspi_periodictuning(struct work_struct *work)
+ 	}
+ 
+ 	/*
+-	 * Wait for any ongoing flash operation to complete before tuning.
+-	 * The request_completion is signaled when the flash is idle.
++	 * Wait (BOUNDED) for any ongoing flash operation to complete before
++	 * tuning.  An unbounded wait_for_completion() here can AB-BA deadlock
++	 * against the exec/resume path: cqspi_exec_mem_op() increments
++	 * inflight_ops and then cqspi_setup_phymode() calls
++	 * cancel_delayed_work_sync(&mem->complete_work), which waits for THIS
++	 * work to return, while this work waits on request_completion.  The
++	 * inflight_ops > 1 guard above only NARROWS the window: it is a
++	 * check-then-act race, so an op can go in-flight (and take the
++	 * cancel_delayed_work_sync path) after the guard passes but before this
++	 * wait.  It is hit on deep-suspend resume, where the setup path re-runs
++	 * to re-establish the DLL tuning.  Bound the wait so the work bails out
++	 * and reschedules instead of wedging the whole resume.  The existing
++	 * !done guard is preserved so an already-signalled completion is not
++	 * consumed.
+ 	 */
+-	if (!mem->request_completion.done)
+-		wait_for_completion(&mem->request_completion);
++	if (!mem->request_completion.done &&
++	    !wait_for_completion_timeout(&mem->request_completion,
++					 msecs_to_jiffies(CQSPI_TUNING_TIMEOUT_MS))) {
++		/* Op still in flight; skip this cycle and retry later. */
++		schedule_delayed_work(&mem->complete_work,
++				      msecs_to_jiffies(CQSPI_TUNING_PERIODICITY_MS));
++		return;
++	}
+ 
+ 	/*
+ 	 * Block new operations during tuning by reinit'ing tuning_complete.

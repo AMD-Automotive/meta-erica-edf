@@ -1,0 +1,261 @@
+From 94b591dee0401dab4c4a9b3862e35aa7f981ade3 Mon Sep 17 00:00:00 2001
+From: LT Thomas <lthomas@amd.com>
+Date: Tue, 22 Sep 2026 01:59:30 +0000
+Subject: [PATCH] al_riscv: fix dma_buf lifetime bugs on client->dma_buffers
+
+Resolves issues around DMABUF free/release
+
+Signed-off-by: LT Thomas <lthomas@amd.com>
+Upstream-Status: Pending
+---
+ al_riscv/al_dmabuf.c    |  20 ++++++++
+ al_riscv/al_riscv_drv.c | 111 +++++++++++++++++++++++++++++++++++++---
+ al_riscv/al_riscv_drv.h |   5 ++
+ 3 files changed, 128 insertions(+), 8 deletions(-)
+
+diff --git a/al_riscv/al_dmabuf.c b/al_riscv/al_dmabuf.c
+index d0b6f94..da4650d 100644
+--- a/al_riscv/al_dmabuf.c
++++ b/al_riscv/al_dmabuf.c
+@@ -198,6 +198,9 @@ static void codec_dmabuf_release(struct dma_buf *dbuf)
+ 	common_dma_free(&dev->common, buffer->size, buffer->cpu_mem,
+ 			buffer->dma_handle);
+ 
++	/* Last use of dinfo->client; release the reference taken at export. */
++	client_ref_put(dinfo->client);
++
+ 	put_device(dinfo->dev);
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)
+ 	kfree_sensitive(buffer);
+@@ -324,6 +327,11 @@ struct dma_buf *codec_dmabuf_wrap(struct device *dev, size_t size,
+ 
+ 	dinfo->dev = get_device(dev);
+ 	dinfo->client = client;
++	/*
++	 * Pin the client: codec_dmabuf_release() below touches dinfo->client
++	 * (->dev and ->dma_lock), and the dma_buf can outlive the client's fd.
++	 */
++	client_ref_get(client);
+ 	dinfo->buffer = buffer;
+ 	dinfo->dma_dir = DMA_BIDIRECTIONAL;
+ 	dinfo->sgt = codec_create_sgt(dinfo);
+@@ -347,6 +355,18 @@ struct dma_buf *codec_dmabuf_wrap(struct device *dev, size_t size,
+ 	return dma_buf;
+ 
+ free_sgt:
++	/*
++	 * Unwind everything taken above. The original only kfree()d dinfo,
++	 * leaking the sg table, the device reference from get_device() and
++	 * (since the client is now pinned here) the client reference too.
++	 * dinfo->sgt may legitimately be an ERR_PTR at this point.
++	 */
++	if (!IS_ERR_OR_NULL(dinfo->sgt)) {
++		sg_free_table(dinfo->sgt);
++		kfree(dinfo->sgt);
++	}
++	client_ref_put(dinfo->client);
++	put_device(dinfo->dev);
+ 	kfree(dinfo);
+ 	return ERR_PTR(-EINVAL);
+ }
+diff --git a/al_riscv/al_riscv_drv.c b/al_riscv/al_riscv_drv.c
+index f98cf13..4b3d590 100644
+--- a/al_riscv/al_riscv_drv.c
++++ b/al_riscv/al_riscv_drv.c
+@@ -7,6 +7,7 @@
+ #include <linux/delay.h>
+ #include <linux/dma-buf.h>
+ #include <linux/dma-mapping.h>
++#include <linux/file.h>
+ #include <linux/firmware.h>
+ #include <linux/interrupt.h>
+ #include <linux/io.h>
+@@ -142,9 +143,28 @@ static inline void client_dma_buf_cleanup(struct codec_client *ctx)
+ 	mutex_lock(&ctx->dma_lock);
+ 
+ 	list_for_each_entry_safe(buf, next, &ctx->dma_buffers, list) {
++		/*
++		 * Unlink first, so that if this buffer still has an exported
++		 * dma_buf alive, the later codec_dmabuf_release() sees an
++		 * already-empty node instead of a poisoned one.
++		 */
++		list_del_init(&buf->list);
++
++		/*
++		 * A buffer exported to userspace via DMA_ALLOC_W_FD is owned by
++		 * its dma_buf. Userspace (or an importer such as MLPP) may still
++		 * hold a reference after this client's fd is closed, and the
++		 * dma_buf keeps a pointer to this al_dma_buf. Freeing the
++		 * backing memory here would leave the exporter pointing at freed
++		 * memory, and codec_dmabuf_release() would double-free it.
++		 * Leave it to codec_dmabuf_release(), which runs when the last
++		 * dma_buf reference is dropped.
++		 */
++		if (buf->dmabuf_handle)
++			continue;
++
+ 		common_dma_free(&dev->common, buf->size, buf->cpu_mem,
+ 				buf->dma_handle);
+-		list_del(&buf->list);
+ 		kfree(buf);
+ 	}
+ 
+@@ -194,7 +214,16 @@ void client_dma_buf_insert(struct codec_client *ctx, struct al_dma_buf *buf)
+ void client_dma_buf_remove(struct codec_client *ctx, struct al_dma_buf *buf)
+ {
+ 	mutex_lock(&ctx->dma_lock);
+-	list_del(&buf->list);
++	/*
++	 * Use list_del_init() rather than list_del(). A buffer can reach here
++	 * twice: once from the teardown/free path that unlinks it, and once
++	 * from codec_dmabuf_release() when userspace finally drops the last
++	 * reference to the exported fd. list_del() leaves LIST_POISON in the
++	 * node, so the second call dereferences 0xdead000000000100/122 and
++	 * oopses. list_del_init() leaves the node self-linked, making a
++	 * repeat removal a harmless no-op.
++	 */
++	list_del_init(&buf->list);
+ 	mutex_unlock(&ctx->dma_lock);
+ }
+ 
+@@ -221,6 +250,24 @@ static void client_put(struct codec_client *client)
+ 	kref_put(&client->refcount, client_cleanup);
+ }
+ 
++/*
++ * An exported dma_buf outlives the fd that created it: userspace, or an
++ * importer such as the MLPP driver, can hold a reference long after this
++ * client's file is closed. codec_dmabuf_release() dereferences
++ * dinfo->client (for ->dev and for the dma_lock), so the exporter must pin
++ * the client for as long as the dma_buf exists. These two wrappers give
++ * al_dmabuf.c access to the refcount without exposing client_cleanup().
++ */
++void client_ref_get(struct codec_client *client)
++{
++	kref_get(&client->refcount);
++}
++
++void client_ref_put(struct codec_client *client)
++{
++	kref_put(&client->refcount, client_cleanup);
++}
++
+ static inline void client_notify_fw(struct codec_dev *dev,
+ 				    struct codec_client *client)
+ {
+@@ -438,6 +485,7 @@ static int codec_ioctl_dma_alloc(struct codec_dev *dev, unsigned long arg,
+ 		return PTR_ERR(buf);
+ 
+ 	if (copy_to_user(ubuf, &info, sizeof(info))) {
++		/* Not yet published and no dma_buf exists; safe to free here. */
+ 		common_dma_free(&dev->common, info.size, buf->cpu_mem,
+ 				buf->dma_handle);
+ 		kfree(buf);
+@@ -456,6 +504,7 @@ static int codec_ioctl_dma_alloc_w_fd(struct codec_dev *dev, unsigned long arg,
+ 	struct codec_dma_info info;
+ 	struct al_dma_buf *buf;
+ 	struct dma_buf *dma_buf;
++	int fd;
+ 
+ 	if (copy_from_user(&info, ubuf, sizeof(info)))
+ 		return -EFAULT;
+@@ -468,22 +517,56 @@ static int codec_ioctl_dma_alloc_w_fd(struct codec_dev *dev, unsigned long arg,
+ 				    client);
+ 
+ 	if (IS_ERR(dma_buf)) {
++		/* No dma_buf was created, so nothing else owns buf yet. */
+ 		common_dma_free(&dev->common, info.size, buf->cpu_mem,
+ 				buf->dma_handle);
++		kfree(buf);
+ 		return PTR_ERR(dma_buf);
+ 	}
+ 
+ 	buf->dmabuf_handle = dma_buf;
+-	info.fd = dma_buf_fd(dma_buf, O_RDWR);
+ 
++	/*
++	 * Publish the buffer before handing an fd to userspace. Once the fd is
++	 * installed it is visible in the process's table and the dma_buf can be
++	 * closed (running codec_dmabuf_release()) at any moment; that path
++	 * expects to find the buffer on the client's list.
++	 */
++	client_dma_buf_insert(client, buf);
++
++	/*
++	 * Reserve the fd and install it only after the descriptor has been
++	 * copied out successfully. dma_buf_fd() would fd_install() immediately,
++	 * leaving no safe way to undo it if copy_to_user() then failed:
++	 * put_unused_fd() must not be used on an already-installed fd, and
++	 * freeing the buffer by hand would leave userspace holding an fd onto
++	 * released memory. Splitting reserve/install is the standard idiom.
++	 */
++	/*
++	 * Match the flags the original dma_buf_fd(dma_buf, O_RDWR) produced.
++	 * dma_buf_fd() passes its flags straight to get_unused_fd_flags(), and
++	 * only O_CLOEXEC is meaningful there -- but keep O_RDWR verbatim so
++	 * userspace-visible behaviour is identical to before this change.
++	 */
++	fd = get_unused_fd_flags(O_RDWR);
++	if (fd < 0) {
++		/*
++		 * Nothing else owns the buffer yet; dropping the last dma_buf
++		 * reference runs codec_dmabuf_release(), which unlinks it,
++		 * frees the DMA memory and drops the client reference.
++		 */
++		dma_buf_put(dma_buf);
++		return fd;
++	}
++
++	info.fd = fd;
+ 	if (copy_to_user(ubuf, &info, sizeof(info))) {
+-		common_dma_free(&dev->common, buf->size, buf->cpu_mem,
+-				buf->dma_handle);
+-		kfree(buf);
++		put_unused_fd(fd);
++		dma_buf_put(dma_buf);
+ 		return -EFAULT;
+ 	}
+ 
+-	client_dma_buf_insert(client, buf);
++	fd_install(fd, dma_buf->file);
+ 
+ 	return 0;
+ }
+@@ -502,8 +585,20 @@ static int codec_ioctl_dma_free(struct codec_dev *dev, unsigned long arg,
+ 	if (!buf)
+ 		return -EINVAL;
+ 
++	/*
++	 * If this buffer was exported with DMA_ALLOC_W_FD its lifetime belongs
++	 * to the dma_buf, not to this ioctl. Unlink it so it is no longer
++	 * visible to lookups or to teardown, but let codec_dmabuf_release()
++	 * do the freeing when the last reference goes away.
++	 */
++	if (buf->dmabuf_handle) {
++		client_dma_buf_remove(client, buf);
++		return 0;
++	}
++
++	client_dma_buf_remove(client, buf);
++
+ 	common_dma_free(&dev->common, buf->size, buf->cpu_mem, buf->dma_handle);
+-	list_del(&buf->list);
+ 	kfree(buf);
+ 
+ 	return 0;
+diff --git a/al_riscv/al_riscv_drv.h b/al_riscv/al_riscv_drv.h
+index 56b6a48..ad70f52 100644
+--- a/al_riscv/al_riscv_drv.h
++++ b/al_riscv/al_riscv_drv.h
+@@ -54,6 +54,11 @@ void client_dma_buf_insert(struct codec_client *ctx, struct al_dma_buf *buf);
+ 
+ void client_dma_buf_remove(struct codec_client *ctx, struct al_dma_buf *buf);
+ 
++/* Pin/unpin a client across the lifetime of an exported dma_buf. */
++void client_ref_get(struct codec_client *client);
++
++void client_ref_put(struct codec_client *client);
++
+ int codec_probe(struct platform_device *pdev);
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
+ void codec_remove(struct platform_device *pdev);

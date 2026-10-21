@@ -1,0 +1,1532 @@
+From ff2dd7991b51191e82c2f8b4dfeb08b3f0ff5ffd Mon Sep 17 00:00:00 2001
+From: Kris Chaplin <kris.chaplin@amd.com>
+Date: Wed, 2 Jul 2025 16:35:00 +0000
+Subject: [PATCH] Xilinx Dummy Src and Switch
+
+---
+ drivers/media/platform/xilinx/Makefile        |   3 +-
+ .../media/platform/xilinx/xilinx-dummy_src.c  | 958 ++++++++++++++++++
+ .../platform/xilinx/xilinx-dummy_switch.c     | 535 ++++++++++
+ 3 files changed, 1495 insertions(+), 1 deletion(-)
+ create mode 100644 drivers/media/platform/xilinx/xilinx-dummy_src.c
+ create mode 100644 drivers/media/platform/xilinx/xilinx-dummy_switch.c
+
+diff --git a/drivers/media/platform/xilinx/Makefile b/drivers/media/platform/xilinx/Makefile
+index d5f90d8631cc..eebd8aa84f31 100644
+--- a/drivers/media/platform/xilinx/Makefile
++++ b/drivers/media/platform/xilinx/Makefile
+@@ -25,4 +25,5 @@ obj-$(CONFIG_VIDEO_XILINX_SDIRXSS) += xilinx-sdirxss.o
+ obj-$(CONFIG_VIDEO_XILINX_TPG) += xilinx-tpg.o
+ obj-$(CONFIG_VIDEO_XILINX_VPSS_CSC) += xilinx-vpss-csc.o
+ obj-$(CONFIG_VIDEO_XILINX_VPSS_SCALER) += xilinx-vpss-scaler.o
+-obj-$(CONFIG_VIDEO_XILINX_VTC) += xilinx-vtc.o
++obj-$(CONFIG_VIDEO_XILINX_VTC) += xilinx-vtc.o xilinx-dummy_src.o xilinx-dummy_switch.o
++obj-$(CONFIG_VIDEO_XILINX_DUMMY_SRC) += xilinx-dummy_src.o
+diff --git a/drivers/media/platform/xilinx/xilinx-dummy_src.c b/drivers/media/platform/xilinx/xilinx-dummy_src.c
+new file mode 100644
+index 000000000000..89d9c5504b1b
+--- /dev/null
++++ b/drivers/media/platform/xilinx/xilinx-dummy_src.c
+@@ -0,0 +1,958 @@
++/*
++ * Xilinx Test Pattern Generator
++ *
++ * Copyright (C) 2013-2015 Ideas on Board
++ * Copyright (C) 2013-2015 Xilinx, Inc.
++ *
++ * Contacts: Hyun Kwon <hyun.kwon@xilinx.com>
++ *           Laurent Pinchart <laurent.pinchart@ideasonboard.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ *
++ * Updated for Linux kernel 6.12.10 V4L2 API compatibility
++ */
++
++#define DEBUG
++
++#include <linux/device.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/string.h>
++#include <linux/xilinx-v4l2-controls.h>
++
++#include <media/v4l2-async.h>
++#include <media/v4l2-ctrls.h>
++#include <media/v4l2-subdev.h>
++#include <media/v4l2-common.h>
++
++#include "xilinx-hls-common.h"
++#include "xilinx-vip.h"
++
++#define XTPG_CTRL_STATUS_SLAVE_ERROR		(1 << 16)
++#define XTPG_CTRL_IRQ_SLAVE_ERROR		(1 << 16)
++
++#define XTPG_PATTERN_CONTROL			0x0100
++#define XTPG_PATTERN_MASK			(0xf << 0)
++#define XTPG_PATTERN_CONTROL_CROSS_HAIRS	(1 << 4)
++#define XTPG_PATTERN_CONTROL_MOVING_BOX		(1 << 5)
++#define XTPG_PATTERN_CONTROL_COLOR_MASK_SHIFT	6
++#define XTPG_PATTERN_CONTROL_COLOR_MASK_MASK	(0xf << 6)
++#define XTPG_PATTERN_CONTROL_STUCK_PIXEL	(1 << 9)
++#define XTPG_PATTERN_CONTROL_NOISE		(1 << 10)
++#define XTPG_PATTERN_CONTROL_MOTION		(1 << 12)
++#define XTPG_MOTION_SPEED			0x0104
++#define XTPG_CROSS_HAIRS			0x0108
++#define XTPG_CROSS_HAIRS_ROW_SHIFT		0
++#define XTPG_CROSS_HAIRS_ROW_MASK		(0xfff << 0)
++#define XTPG_CROSS_HAIRS_COLUMN_SHIFT		16
++#define XTPG_CROSS_HAIRS_COLUMN_MASK		(0xfff << 16)
++#define XTPG_ZPLATE_HOR_CONTROL			0x010c
++#define XTPG_ZPLATE_VER_CONTROL			0x0110
++#define XTPG_ZPLATE_START_SHIFT			0
++#define XTPG_ZPLATE_START_MASK			(0xffff << 0)
++#define XTPG_ZPLATE_SPEED_SHIFT			16
++#define XTPG_ZPLATE_SPEED_MASK			(0xffff << 16)
++#define XTPG_BOX_SIZE				0x0114
++#define XTPG_BOX_COLOR				0x0118
++#define XTPG_STUCK_PIXEL_THRESH			0x011c
++#define XTPG_NOISE_GAIN				0x0120
++#define XTPG_BAYER_PHASE			0x0124
++#define XTPG_BAYER_PHASE_RGGB			0
++#define XTPG_BAYER_PHASE_GRBG			1
++#define XTPG_BAYER_PHASE_GBRG			2
++#define XTPG_BAYER_PHASE_BGGR			3
++#define XTPG_BAYER_PHASE_OFF			4
++
++/* TPG v7 is a completely redesigned IP using Vivado HLS
++ * having a different AXI4-Lite interface
++ */
++#define XTPG_HLS_BG_PATTERN			0x0020
++#define XTPG_HLS_FG_PATTERN			0x0028
++#define XTPG_HLS_FG_PATTERN_CROSS_HAIR		(1 << 1)
++#define XTPG_HLS_MASK_ID			0x0030
++#define XTPG_HLS_MOTION_SPEED			0x0038
++#define XTPG_HLS_COLOR_FORMAT			0x0040
++#define XTPG_HLS_COLOR_FORMAT_RGB		0
++#define XTPG_HLS_COLOR_FORMAT_YUV_444		1
++#define XTPG_HLS_COLOR_FORMAT_YUV_422		2
++#define XTPG_HLS_COLOR_FORMAT_YUV_420		3
++#define XTPG_HLS_CROSS_HAIR_HOR			0x0048
++#define XTPG_HLS_CROSS_HAIR_VER			0x0050
++#define XTPG_HLS_ZPLATE_HOR_CNTL_START		0x0058
++#define XTPG_HLS_ZPLATE_HOR_CNTL_DELTA		0x0060
++#define XTPG_HLS_ZPLATE_VER_CNTL_START		0x0068
++#define XTPG_HLS_ZPLATE_VER_CNTL_DELTA		0x0070
++#define XTPG_HLS_BOX_SIZE			0x0078
++#define XTPG_HLS_BOX_COLOR_RED_CB		0x0080
++#define XTPG_HLS_BOX_COLOR_GREEN_CR		0x0088
++#define XTPG_HLS_BOX_COLOR_BLUE_Y		0x0090
++#define XTPG_HLS_ENABLE_INPUT			0x0098
++#define XTPG_HLS_USE_INPUT_VID_STREAM		(1 << 0)
++#define XTPG_HLS_PASS_THRU_START_X		0x00a0
++#define XTPG_HLS_PASS_THRU_START_Y		0x00a8
++#define XTPG_HLS_PASS_THRU_END_X		0x00b0
++#define XTPG_HLS_PASS_THRU_END_Y		0x00b8
++
++/*
++ * The minimum blanking value is one clock cycle for the front porch, one clock
++ * cycle for the sync pulse and one clock cycle for the back porch.
++ */
++#define XTPG_MIN_HBLANK			3
++#define XTPG_MAX_HBLANK			4096
++#define XTPG_MIN_VBLANK			3
++#define XTPG_MAX_VBLANK			4096
++
++#define XTPG_MIN_WIDTH			(64)
++#define XTPG_MIN_HEIGHT			(64)
++#define XTPG_MAX_WIDTH			(10328)
++#define XTPG_MAX_HEIGHT			(7760)
++
++#define XTPG_MIN_PPC			1
++
++#define XTPG_MIN_FRM_INT		1
++
++/**
++ * struct xtpg_device - Xilinx Test Pattern Generator device structure
++ * @xvip: Xilinx Video IP device
++ * @pads: media pads
++ * @npads: number of pads (1 or 2)
++ * @has_input: whether an input is connected to the sink pad
++ * @formats: active V4L2 media bus format for each pad
++ * @default_format: default V4L2 media bus format
++ * @vip_format: format information corresponding to the active format
++ * @bayer: boolean flag if TPG is set to any bayer format
++ * @ctrl_handler: control handler
++ * @hblank: horizontal blanking control
++ * @vblank: vertical blanking control
++ * @pattern: test pattern control
++ * @streaming: is the video stream active
++ * @max_width: Maximum width supported by this instance
++ * @max_height: Maximum height supported by this instance
++ * @fi_d: frame interval denominator
++ * @fi_n: frame interval numerator
++ * @ppc: Pixels per clock control
++ */
++struct xtpg_device {
++	struct xvip_device xvip;
++
++	struct media_pad pads[2];
++	unsigned int npads;
++	bool has_input;
++
++	struct v4l2_mbus_framefmt formats[2];
++	struct v4l2_mbus_framefmt default_format;
++	const struct xvip_video_format *vip_format;
++	bool bayer;
++
++	struct v4l2_ctrl_handler ctrl_handler;
++	struct v4l2_ctrl *hblank;
++	struct v4l2_ctrl *vblank;
++	struct v4l2_ctrl *pattern;
++	bool streaming;
++
++	u32 max_width;
++	u32 max_height;
++	u32 fi_d;
++	u32 fi_n;
++	u32 ppc;
++};
++
++static inline struct xtpg_device *to_tpg(struct v4l2_subdev *subdev)
++{
++	return container_of(subdev, struct xtpg_device, xvip.subdev);
++}
++
++static u32 xtpg_get_bayer_phase(unsigned int code)
++{
++	switch (code) {
++	case MEDIA_BUS_FMT_SRGGB8_1X8:
++		return XTPG_BAYER_PHASE_RGGB;
++	case MEDIA_BUS_FMT_SGRBG8_1X8:
++		return XTPG_BAYER_PHASE_GRBG;
++	case MEDIA_BUS_FMT_SGBRG8_1X8:
++		return XTPG_BAYER_PHASE_GBRG;
++	case MEDIA_BUS_FMT_SBGGR8_1X8:
++		return XTPG_BAYER_PHASE_BGGR;
++	default:
++		return XTPG_BAYER_PHASE_OFF;
++	}
++}
++
++static void __xtpg_update_pattern_control(struct xtpg_device *xtpg,
++					  bool passthrough, bool pattern)
++{
++	u32 pattern_mask = (1 << (xtpg->pattern->maximum + 1)) - 1;
++
++	/*
++	 * If the TPG has no sink pad or no input connected to its sink pad
++	 * passthrough mode can't be enabled.
++	 */
++	if (xtpg->npads == 1 || !xtpg->has_input)
++		passthrough = false;
++
++	/* If passthrough mode is allowed unmask bit 0. */
++	if (passthrough)
++		pattern_mask &= ~1;
++
++	/* If test pattern mode is allowed unmask all other bits. */
++	if (pattern)
++		pattern_mask &= 1;
++
++	__v4l2_ctrl_modify_range(xtpg->pattern, 0, xtpg->pattern->maximum,
++				 pattern_mask, pattern ? 9 : 0);
++}
++
++static void xtpg_update_pattern_control(struct xtpg_device *xtpg,
++					bool passthrough, bool pattern)
++{
++	mutex_lock(xtpg->ctrl_handler.lock);
++	__xtpg_update_pattern_control(xtpg, passthrough, pattern);
++	mutex_unlock(xtpg->ctrl_handler.lock);
++}
++
++/* -----------------------------------------------------------------------------
++ * V4L2 Subdevice Video Operations
++ */
++
++static int xtpg_s_stream(struct v4l2_subdev *subdev, int enable)
++{
++	struct xtpg_device *xtpg = to_tpg(subdev);
++	//unsigned int width = xtpg->formats[0].width; // BW
++	//unsigned int height = xtpg->formats[0].height; // BW
++	bool passthrough;
++	u32 bayer_phase;
++
++	if (!enable) {
++		
++		/*
++		 * There is an known issue in TPG v7.0 that on
++		 * resolution change it doesn't generates pattern
++		 * correctly i.e some hor/ver offset is added.
++		 * As a workaround issue reset on stop.
++		 */
++
++		v4l2_ctrl_handler_setup(&xtpg->ctrl_handler);
++
++		xtpg_update_pattern_control(xtpg, true, true);
++		xtpg->streaming = false;
++		return 0;
++	}
++
++	/*
++	 * Configure the bayer phase and video timing mux based on the
++	 * operation mode (passthrough or test pattern generation). The test
++	 * pattern can be modified by the control set handler, we thus need to
++	 * take the control lock here to avoid races.
++	 */
++	mutex_lock(xtpg->ctrl_handler.lock);
++
++	/*
++	 * Switching between passthrough and test pattern generation modes isn't
++	 * allowed during streaming, update the control range accordingly.
++	 */
++	passthrough = xtpg->pattern->cur.val == 0;
++	__xtpg_update_pattern_control(xtpg, passthrough, !passthrough);
++
++	xtpg->streaming = true;
++
++	mutex_unlock(xtpg->ctrl_handler.lock);
++
++
++	/*
++	 * For TPG v5.0, the bayer phase needs to be off for the pass
++	 * through mode, otherwise the external input would
++	 * be subsampled.
++	 */
++	bayer_phase = passthrough ? XTPG_BAYER_PHASE_OFF
++		    : xtpg_get_bayer_phase(xtpg->formats[0].code);
++
++	return 0;
++}
++
++/* -----------------------------------------------------------------------------
++ * V4L2 Subdevice Pad Operations
++ */
++
++static struct v4l2_mbus_framefmt *
++__xtpg_get_pad_format(struct xtpg_device *xtpg,
++		      struct v4l2_subdev_state *sd_state,
++		      unsigned int pad, u32 which)
++{
++	switch (which) {
++	case V4L2_SUBDEV_FORMAT_TRY:
++		return v4l2_subdev_state_get_format(sd_state, pad);
++	case V4L2_SUBDEV_FORMAT_ACTIVE:
++		return &xtpg->formats[pad];
++	default:
++		return NULL;
++	}
++}
++
++static int xtpg_get_format(struct v4l2_subdev *subdev,
++			   struct v4l2_subdev_state *sd_state,
++			   struct v4l2_subdev_format *fmt)
++{
++	struct xtpg_device *xtpg = to_tpg(subdev);
++
++	fmt->format = *__xtpg_get_pad_format(xtpg, sd_state, fmt->pad, fmt->which);
++
++	return 0;
++}
++
++static int xtpg_set_format(struct v4l2_subdev *subdev,
++			   struct v4l2_subdev_state *sd_state,
++			   struct v4l2_subdev_format *fmt)
++{
++	struct xtpg_device *xtpg = to_tpg(subdev);
++	struct v4l2_mbus_framefmt *__format;
++	u32 bayer_phase;
++
++	__format = __xtpg_get_pad_format(xtpg, sd_state, fmt->pad, fmt->which);
++
++	/* In two pads mode the source pad format is always identical to the
++	 * sink pad format.
++	 */
++	if (xtpg->npads == 2 && fmt->pad == 1) {
++		fmt->format = *__format;
++		return 0;
++	}
++
++	/* Bayer phase is configurable at runtime */
++	if (xtpg->bayer) {
++		bayer_phase = xtpg_get_bayer_phase(fmt->format.code);
++		if (bayer_phase != XTPG_BAYER_PHASE_OFF)
++			__format->code = fmt->format.code;
++	}
++
++	__format->width = clamp_t(unsigned int, fmt->format.width,
++				  XTPG_MIN_WIDTH, xtpg->max_width);
++	__format->height = clamp_t(unsigned int, fmt->format.height,
++				   XTPG_MIN_HEIGHT, xtpg->max_height);
++
++	fmt->format = *__format;
++
++	/* Propagate the format to the source pad. */
++	if (xtpg->npads == 2) {
++		__format = __xtpg_get_pad_format(xtpg, sd_state, 1, fmt->which);
++		*__format = fmt->format;
++	}
++
++	return 0;
++}
++
++/* -----------------------------------------------------------------------------
++ * V4L2 Subdevice Operations
++ */
++
++static int xtpg_enum_frame_size(struct v4l2_subdev *subdev,
++				struct v4l2_subdev_state *sd_state,
++				struct v4l2_subdev_frame_size_enum *fse)
++{
++	struct v4l2_mbus_framefmt *format;
++	struct xtpg_device *xtpg = to_tpg(subdev);
++
++	format = v4l2_subdev_state_get_format(sd_state, fse->pad);
++
++	if (fse->index || fse->code != format->code)
++		return -EINVAL;
++
++	/* Min / max values for pad 0 is always fixed in both one and two pads
++	 * modes. In two pads mode, the source pad(= 1) size is identical to
++	 * the sink pad size.
++	 */
++	if (fse->pad == 0) {
++		fse->min_width = XTPG_MIN_WIDTH;
++		fse->max_width = xtpg->max_width;
++		fse->min_height = XTPG_MIN_HEIGHT;
++		fse->max_height = xtpg->max_height;
++	} else {
++		fse->min_width = format->width;
++		fse->max_width = format->width;
++		fse->min_height = format->height;
++		fse->max_height = format->height;
++	}
++
++	return 0;
++}
++
++static int xtpg_open(struct v4l2_subdev *subdev, struct v4l2_subdev_fh *fh)
++{
++	struct xtpg_device *xtpg = to_tpg(subdev);
++	struct v4l2_mbus_framefmt *format;
++
++	format = v4l2_subdev_state_get_format(fh->state, 0);
++	*format = xtpg->default_format;
++
++	if (xtpg->npads == 2) {
++		format = v4l2_subdev_state_get_format(fh->state, 1);
++		*format = xtpg->default_format;
++	}
++
++	return 0;
++}
++
++static int xtpg_close(struct v4l2_subdev *subdev, struct v4l2_subdev_fh *fh)
++{
++	return 0;
++}
++
++static int xtpg_s_ctrl(struct v4l2_ctrl *ctrl)
++{
++	/*struct xtpg_device *xtpg = container_of(ctrl->handler,
++						struct xtpg_device,
++						ctrl_handler);*/ // BW
++
++	return 0;
++}
++
++static const struct v4l2_ctrl_ops xtpg_ctrl_ops = {
++	.s_ctrl	= xtpg_s_ctrl,
++};
++
++static const struct v4l2_subdev_core_ops xtpg_core_ops = {
++};
++
++static const struct v4l2_subdev_video_ops xtpg_video_ops = {
++	.s_stream = xtpg_s_stream,
++};
++
++static const struct v4l2_subdev_pad_ops xtpg_pad_ops = {
++	.enum_mbus_code		= xvip_enum_mbus_code,
++	.enum_frame_size	= xtpg_enum_frame_size,
++	.get_fmt		= xtpg_get_format,
++	.set_fmt		= xtpg_set_format,
++};
++
++static const struct v4l2_subdev_ops xtpg_ops = {
++	.core   = &xtpg_core_ops,
++	.video  = &xtpg_video_ops,
++	.pad    = &xtpg_pad_ops,
++};
++
++static const struct v4l2_subdev_internal_ops xtpg_internal_ops = {
++	.open	= xtpg_open,
++	.close	= xtpg_close,
++};
++
++/*
++ * Control Config
++ */
++
++static const char *const xtpg_pattern_strings[] = {
++	"Passthrough",
++	"Horizontal Ramp",
++	"Vertical Ramp",
++	"Temporal Ramp",
++	"Solid Red",
++	"Solid Green",
++	"Solid Blue",
++	"Solid Black",
++	"Solid White",
++	"Color Bars",
++	"Zone Plate",
++	"Tartan Color Bars",
++	"Cross Hatch",
++	"None",
++	"Vertical/Horizontal Ramps",
++	"Black/White Checker Board",
++};
++
++static const char *const xtpg_hls_pattern_strings[] = {
++	"Passthrough",
++	"Horizontal Ramp",
++	"Vertical Ramp",
++	"Temporal Ramp",
++	"Solid Red",
++	"Solid Green",
++	"Solid Blue",
++	"Solid Black",
++	"Solid White",
++	"Color Bars",
++	"Zone Plate",
++	"Tartan Color Bars",
++	"Cross Hatch",
++	"Color Sweep",
++	"Vertical/Horizontal Ramps",
++	"Black/White Checker Board",
++	"PseudoRandom",
++};
++
++static const char *const xtpg_hls_fg_strings[] = {
++	"No Overlay",
++	"Moving Box",
++	"Cross Hairs",
++};
++
++static const struct v4l2_ctrl_config xtpg_hls_fg_ctrl = {
++	.ops	= &xtpg_ctrl_ops,
++	.id     = V4L2_CID_XILINX_TPG_HLS_FG_PATTERN,
++	.name   = "Test Pattern: Foreground Pattern",
++	.type   = V4L2_CTRL_TYPE_MENU,
++	.min	= 0,
++	.max	= ARRAY_SIZE(xtpg_hls_fg_strings) - 1,
++	.qmenu	= xtpg_hls_fg_strings,
++};
++
++static struct v4l2_ctrl_config xtpg_common_ctrls[] = {
++	{
++		.ops    = &xtpg_ctrl_ops,
++		.id     = V4L2_CID_XILINX_TPG_COLOR_MASK,
++		.name   = "Test Pattern: Color Mask",
++		.type   = V4L2_CTRL_TYPE_BITMASK,
++		.min    = 0,
++		.max    = 0x7,
++		.def    = 0,
++	}, {
++		.ops	= &xtpg_ctrl_ops,
++		.id	= V4L2_CID_XILINX_TPG_MOTION_SPEED,
++		.name	= "Test Pattern: Motion Speed",
++		.type	= V4L2_CTRL_TYPE_INTEGER,
++		.min	= 0,
++		.max	= (1 << 8) - 1,
++		.step	= 1,
++		.def	= 4,
++		.flags	= V4L2_CTRL_FLAG_SLIDER,
++	}, {
++		.ops	= &xtpg_ctrl_ops,
++		.id	= V4L2_CID_XILINX_TPG_CROSS_HAIR_ROW,
++		.name	= "Test Pattern: Cross Hairs Row",
++		.type	= V4L2_CTRL_TYPE_INTEGER,
++		.min	= 0,
++		.max	= (1 << 12) - 1,
++		.step	= 1,
++		.def	= 0x64,
++		.flags	= V4L2_CTRL_FLAG_SLIDER,
++	}, {
++		.ops	= &xtpg_ctrl_ops,
++		.id	= V4L2_CID_XILINX_TPG_CROSS_HAIR_COLUMN,
++		.name	= "Test Pattern: Cross Hairs Column",
++		.type	= V4L2_CTRL_TYPE_INTEGER,
++		.min	= 0,
++		.max	= (1 << 12) - 1,
++		.step	= 1,
++		.def	= 0x64,
++		.flags	= V4L2_CTRL_FLAG_SLIDER,
++	}, {
++		.ops	= &xtpg_ctrl_ops,
++		.id	= V4L2_CID_XILINX_TPG_ZPLATE_HOR_START,
++		.name	= "Test Pattern: Zplate Horizontal Start Pos",
++		.type	= V4L2_CTRL_TYPE_INTEGER,
++		.min	= 0,
++		.max	= (1 << 16) - 1,
++		.step	= 1,
++		.def	= 0x1e,
++		.flags	= V4L2_CTRL_FLAG_SLIDER,
++	}, {
++		.ops	= &xtpg_ctrl_ops,
++		.id	= V4L2_CID_XILINX_TPG_ZPLATE_HOR_SPEED,
++		.name	= "Test Pattern: Zplate Horizontal Speed",
++		.type	= V4L2_CTRL_TYPE_INTEGER,
++		.min	= 0,
++		.max	= (1 << 16) - 1,
++		.step	= 1,
++		.def	= 0,
++		.flags	= V4L2_CTRL_FLAG_SLIDER,
++	}, {
++		.ops	= &xtpg_ctrl_ops,
++		.id	= V4L2_CID_XILINX_TPG_ZPLATE_VER_START,
++		.name	= "Test Pattern: Zplate Vertical Start Pos",
++		.type	= V4L2_CTRL_TYPE_INTEGER,
++		.min	= 0,
++		.max	= (1 << 16) - 1,
++		.step	= 1,
++		.def	= 1,
++		.flags	= V4L2_CTRL_FLAG_SLIDER,
++	}, {
++		.ops	= &xtpg_ctrl_ops,
++		.id	= V4L2_CID_XILINX_TPG_ZPLATE_VER_SPEED,
++		.name	= "Test Pattern: Zplate Vertical Speed",
++		.type	= V4L2_CTRL_TYPE_INTEGER,
++		.min	= 0,
++		.max	= (1 << 16) - 1,
++		.step	= 1,
++		.def	= 0,
++		.flags	= V4L2_CTRL_FLAG_SLIDER,
++	}, {
++		.ops	= &xtpg_ctrl_ops,
++		.id	= V4L2_CID_XILINX_TPG_BOX_SIZE,
++		.name	= "Test Pattern: Box Size",
++		.type	= V4L2_CTRL_TYPE_INTEGER,
++		.min	= 0,
++		.max	= (1 << 12) - 1,
++		.step	= 1,
++		.def	= 0x32,
++		.flags	= V4L2_CTRL_FLAG_SLIDER,
++	}, {
++		.ops	= &xtpg_ctrl_ops,
++		.id	= V4L2_CID_XILINX_TPG_BOX_COLOR,
++		.name	= "Test Pattern: Box Color(RGB/YCbCr)",
++		.type	= V4L2_CTRL_TYPE_INTEGER,
++		.min	= 0,
++		.max	= (1 << 24) - 1,
++		.step	= 1,
++		.def	= 0,
++	},
++};
++
++static struct v4l2_ctrl_config xtpg_ctrls[] = {
++	{
++		.ops	= &xtpg_ctrl_ops,
++		.id	= V4L2_CID_XILINX_TPG_CROSS_HAIRS,
++		.name	= "Test Pattern: Cross Hairs",
++		.type	= V4L2_CTRL_TYPE_BOOLEAN,
++		.min	= false,
++		.max	= true,
++		.step	= 1,
++		.def	= 0,
++	}, {
++		.ops	= &xtpg_ctrl_ops,
++		.id	= V4L2_CID_XILINX_TPG_MOVING_BOX,
++		.name	= "Test Pattern: Moving Box",
++		.type	= V4L2_CTRL_TYPE_BOOLEAN,
++		.min	= false,
++		.max	= true,
++		.step	= 1,
++		.def	= 0,
++	}, {
++		.ops	= &xtpg_ctrl_ops,
++		.id	= V4L2_CID_XILINX_TPG_STUCK_PIXEL,
++		.name	= "Test Pattern: Stuck Pixel",
++		.type	= V4L2_CTRL_TYPE_BOOLEAN,
++		.min	= false,
++		.max	= true,
++		.step	= 1,
++		.def	= 0,
++	}, {
++		.ops	= &xtpg_ctrl_ops,
++		.id	= V4L2_CID_XILINX_TPG_NOISE,
++		.name	= "Test Pattern: Noise",
++		.type	= V4L2_CTRL_TYPE_BOOLEAN,
++		.min	= false,
++		.max	= true,
++		.step	= 1,
++		.def	= 0,
++	}, {
++		.ops	= &xtpg_ctrl_ops,
++		.id	= V4L2_CID_XILINX_TPG_MOTION,
++		.name	= "Test Pattern: Motion",
++		.type	= V4L2_CTRL_TYPE_BOOLEAN,
++		.min	= false,
++		.max	= true,
++		.step	= 1,
++		.def	= 0,
++	}, {
++		.ops	= &xtpg_ctrl_ops,
++		.id	= V4L2_CID_XILINX_TPG_STUCK_PIXEL_THRESH,
++		.name	= "Test Pattern: Stuck Pixel threshold",
++		.type	= V4L2_CTRL_TYPE_INTEGER,
++		.min	= 0,
++		.max	= (1 << 16) - 1,
++		.step	= 1,
++		.def	= 0,
++		.flags	= V4L2_CTRL_FLAG_SLIDER,
++	}, {
++		.ops	= &xtpg_ctrl_ops,
++		.id	= V4L2_CID_XILINX_TPG_NOISE_GAIN,
++		.name	= "Test Pattern: Noise Gain",
++		.type	= V4L2_CTRL_TYPE_INTEGER,
++		.min	= 0,
++		.max	= (1 << 8) - 1,
++		.step	= 1,
++		.def	= 0,
++		.flags	= V4L2_CTRL_FLAG_SLIDER,
++	},
++};
++
++/* -----------------------------------------------------------------------------
++ * Media Operations
++ */
++
++static const struct media_entity_operations xtpg_media_ops = {
++	.link_validate = v4l2_subdev_link_validate,
++};
++
++/* -----------------------------------------------------------------------------
++ * Power Management
++ */
++
++static int __maybe_unused xtpg_pm_suspend(struct device *dev)
++{
++	//struct xtpg_device *xtpg = dev_get_drvdata(dev); // BW
++
++	return 0;
++}
++
++static int __maybe_unused xtpg_pm_resume(struct device *dev)
++{
++	//struct xtpg_device *xtpg = dev_get_drvdata(dev); // BW
++
++	return 0;
++}
++
++/* -----------------------------------------------------------------------------
++ * Platform Device Driver
++ */
++
++static int xtpg_parse_of(struct xtpg_device *xtpg)
++{
++	struct device *dev = xtpg->xvip.dev;
++	struct device_node *node = xtpg->xvip.dev->of_node;
++	struct device_node *ports;
++	struct device_node *port;
++	unsigned int nports = 0;
++	bool has_endpoint = false;
++	int ret;
++
++	printk("Dummy source driver parsing...\n");
++
++	ret = of_property_read_u32(node, "xlnx,max-height",
++				   &xtpg->max_height);
++	if (ret < 0) {
++		if (of_device_is_compatible(dev->of_node, "xlnx,v-tpg-8.0")) {
++			dev_err(dev, "xlnx,max-height dt property is missing!");
++			return -EINVAL;
++		}
++		xtpg->max_height = XTPG_MAX_HEIGHT;
++	} else if (xtpg->max_height > XTPG_MAX_HEIGHT ||
++		   xtpg->max_height < XTPG_MIN_HEIGHT) {
++		dev_err(dev, "Invalid height in dt");
++		return -EINVAL;
++	}
++
++	ret = of_property_read_u32(node, "xlnx,max-width",
++				   &xtpg->max_width);
++	if (ret < 0) {
++		if (of_device_is_compatible(dev->of_node, "xlnx,v-tpg-8.0")) {
++			dev_err(dev, "xlnx,max-width dt property is missing!");
++			return -EINVAL;
++		}
++		xtpg->max_width = XTPG_MAX_WIDTH;
++	} else if (xtpg->max_width > XTPG_MAX_WIDTH ||
++		   xtpg->max_width < XTPG_MIN_WIDTH) {
++		dev_err(dev, "Invalid width in dt");
++		return -EINVAL;
++	}
++
++	ret = of_property_read_u32(node, "xlnx,ppc",
++				   &xtpg->ppc);
++	if (ret < 0) {
++		xtpg->ppc = XTPG_MIN_PPC;
++		dev_dbg(dev, "failed to read ppc in dt\n");
++	} else if ((xtpg->ppc != 1) && (xtpg->ppc != 2) &&
++			(xtpg->ppc != 4) && (xtpg->ppc != 8)) {
++		dev_err(dev, "Invalid ppc config in dt\n");
++		return -EINVAL;
++	}
++
++	ports = of_get_child_by_name(node, "ports");
++	if (ports == NULL)
++		ports = node;
++
++	for_each_child_of_node_scoped(ports, port) {
++		const struct xvip_video_format *format;
++		struct device_node *endpoint;
++
++		if (!port->name || of_node_cmp(port->name, "port"))
++			continue;
++
++		format = xvip_of_get_format(port);
++		if (IS_ERR(format)) {
++			dev_err(dev, "invalid format in DT");
++			return PTR_ERR(format);
++		}
++
++		/* Get and check the format description */
++		if (!xtpg->vip_format) {
++			xtpg->vip_format = format;
++		} else if (xtpg->vip_format != format) {
++			dev_err(dev, "in/out format mismatch in DT");
++			return -EINVAL;
++		}
++
++		if (nports == 0) {
++			endpoint = of_get_next_child(port, NULL);
++			if (endpoint)
++				has_endpoint = true;
++			of_node_put(endpoint);
++		}
++
++		/* Count the number of ports. */
++		nports++;
++	}
++
++	if (nports != 1 && nports != 2) {
++		dev_err(dev, "invalid number of ports %u\n", nports);
++		return -EINVAL;
++	}
++
++	xtpg->npads = nports;
++	if (nports == 2 && has_endpoint)
++		xtpg->has_input = true;
++
++	return 0;
++}
++
++static int xtpg_probe(struct platform_device *pdev)
++{
++	struct v4l2_subdev *subdev;
++	struct xtpg_device *xtpg;
++	u32 i, bayer_phase;
++	u32 npatterns;
++	int ret;
++
++	printk("Dummy source driver probing...\n");
++
++	xtpg = devm_kzalloc(&pdev->dev, sizeof(*xtpg), GFP_KERNEL);
++	if (!xtpg)
++		return -ENOMEM;
++
++	xtpg->xvip.dev = &pdev->dev;
++
++	ret = xtpg_parse_of(xtpg);
++	if (ret < 0)
++		return ret;
++
++	/* Initialize V4L2 subdevice and media entity. Pad numbers depend on the
++	 * number of pads.
++	 */
++	if (xtpg->npads == 2) {
++		xtpg->pads[0].flags = MEDIA_PAD_FL_SINK;
++		xtpg->pads[1].flags = MEDIA_PAD_FL_SOURCE;
++	} else {
++		xtpg->pads[0].flags = MEDIA_PAD_FL_SOURCE;
++	}
++
++	/* Initialize the default format */
++	xtpg->default_format.code = xtpg->vip_format->code;
++	xtpg->default_format.field = V4L2_FIELD_NONE;
++	xtpg->default_format.colorspace = V4L2_COLORSPACE_SRGB;
++	npatterns = ARRAY_SIZE(xtpg_pattern_strings);
++	xtpg->default_format.width = 1280; // This is just default; can change it
++	xtpg->default_format.height = 720;
++
++	bayer_phase = xtpg_get_bayer_phase(xtpg->vip_format->code);
++	if (bayer_phase != XTPG_BAYER_PHASE_OFF)
++		xtpg->bayer = true;
++
++	xtpg->formats[0] = xtpg->default_format;
++	if (xtpg->npads == 2)
++		xtpg->formats[1] = xtpg->default_format;
++
++	/* Initialize V4L2 subdevice and media entity */
++	subdev = &xtpg->xvip.subdev;
++	v4l2_subdev_init(subdev, &xtpg_ops);
++	subdev->dev = &pdev->dev;
++	subdev->internal_ops = &xtpg_internal_ops;
++	strscpy(subdev->name, dev_name(&pdev->dev), sizeof(subdev->name));
++	v4l2_set_subdevdata(subdev, xtpg);
++	subdev->flags |= V4L2_SUBDEV_FL_HAS_DEVNODE;
++	subdev->entity.ops = &xtpg_media_ops;
++
++	ret = media_entity_pads_init(&subdev->entity, xtpg->npads, xtpg->pads);
++	if (ret < 0)
++		goto error;
++
++	v4l2_ctrl_handler_init(&xtpg->ctrl_handler, 3 +
++			       ARRAY_SIZE(xtpg_common_ctrls) +
++			       ARRAY_SIZE(xtpg_ctrls));
++
++	xtpg->vblank = v4l2_ctrl_new_std(&xtpg->ctrl_handler, &xtpg_ctrl_ops,
++					 V4L2_CID_VBLANK, XTPG_MIN_VBLANK,
++					 XTPG_MAX_VBLANK, 1, 100);
++	xtpg->hblank = v4l2_ctrl_new_std(&xtpg->ctrl_handler, &xtpg_ctrl_ops,
++					 V4L2_CID_HBLANK, XTPG_MIN_HBLANK,
++					 XTPG_MAX_HBLANK, 1, 100);
++
++	xtpg->pattern =
++		v4l2_ctrl_new_std_menu_items(&xtpg->ctrl_handler,
++					     &xtpg_ctrl_ops,
++					     V4L2_CID_TEST_PATTERN,
++					     npatterns - 1,
++					     1, 9,
++					     xtpg_pattern_strings);
++
++	for (i = 0; i < ARRAY_SIZE(xtpg_ctrls); i++)
++		v4l2_ctrl_new_custom(&xtpg->ctrl_handler,
++				     &xtpg_ctrls[i], NULL);
++
++	for (i = 0; i < ARRAY_SIZE(xtpg_common_ctrls); i++)
++		v4l2_ctrl_new_custom(&xtpg->ctrl_handler,
++				     &xtpg_common_ctrls[i], NULL);
++
++	if (xtpg->ctrl_handler.error) {
++		dev_err(&pdev->dev, "failed to add controls\n");
++		ret = xtpg->ctrl_handler.error;
++		goto error;
++	}
++
++	subdev->ctrl_handler = &xtpg->ctrl_handler;
++
++	xtpg_update_pattern_control(xtpg, true, true);
++
++	ret = v4l2_ctrl_handler_setup(&xtpg->ctrl_handler);
++	if (ret < 0) {
++		dev_err(&pdev->dev, "failed to set controls\n");
++		goto error;
++	}
++
++	platform_set_drvdata(pdev, xtpg);
++
++	/* Initialize default frame interval */
++	xtpg->fi_n = 1;
++	xtpg->fi_d = 30;
++
++	ret = v4l2_async_register_subdev(subdev);
++	if (ret < 0) {
++		dev_err(&pdev->dev, "failed to register subdev\n");
++		goto error;
++	}
++
++	printk("Dummy src probe success!\n");
++	return 0;
++
++error:
++	v4l2_ctrl_handler_free(&xtpg->ctrl_handler);
++	media_entity_cleanup(&subdev->entity);
++/*error_resource:
++	xvip_cleanup_resources(&xtpg->xvip);*/ // BW
++	return ret;
++}
++
++static void xtpg_remove(struct platform_device *pdev)
++{
++	struct xtpg_device *xtpg = platform_get_drvdata(pdev);
++	struct v4l2_subdev *subdev = &xtpg->xvip.subdev;
++
++	v4l2_async_unregister_subdev(subdev);
++	v4l2_ctrl_handler_free(&xtpg->ctrl_handler);
++	media_entity_cleanup(&subdev->entity);
++
++	xvip_cleanup_resources(&xtpg->xvip);
++}
++
++static SIMPLE_DEV_PM_OPS(xtpg_pm_ops, xtpg_pm_suspend, xtpg_pm_resume);
++
++static const struct of_device_id dummy_src_of_id_table[] = {
++	{ .compatible = "xlnx,dummy_src" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, dummy_src_of_id_table);
++
++static struct platform_driver dummy_src_driver = {
++	.driver = {
++		.name		= "xilinx-dummy_src",
++		.pm		= &xtpg_pm_ops,
++		.of_match_table	= dummy_src_of_id_table,
++	},
++	.probe			= xtpg_probe,
++	.remove			= xtpg_remove,
++};
++
++module_platform_driver(dummy_src_driver);
++
++MODULE_AUTHOR("Laurent Pinchart <laurent.pinchart@ideasonboard.com>");
++MODULE_DESCRIPTION("Xilinx Test Pattern Generator Driver");
++MODULE_LICENSE("GPL v2");
+diff --git a/drivers/media/platform/xilinx/xilinx-dummy_switch.c b/drivers/media/platform/xilinx/xilinx-dummy_switch.c
+new file mode 100644
+index 000000000000..63d3e3830fd5
+--- /dev/null
++++ b/drivers/media/platform/xilinx/xilinx-dummy_switch.c
+@@ -0,0 +1,535 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Xilinx AXI4-Stream Video Switch
++ *
++ * Copyright (C) 2018 Xilinx, Inc.
++ *
++ * Author: Vishal Sagar <vishal.sagar@xilinx.com>
++ *
++ * Updated for Linux kernel 6.12.10 V4L2 API compatibility
++ */
++
++#include <linux/clk.h>
++#include <linux/device.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/string.h>
++
++#include <media/media-device.h>
++#include <media/v4l2-async.h>
++#include <media/v4l2-subdev.h>
++#include <media/v4l2-common.h>
++
++#include "xilinx-vip.h"
++
++#define XVSW_CTRL_REG			0x00
++#define XVSW_CTRL_REG_UPDATE_MASK	BIT(1)
++
++#define XVSW_MI_MUX_REG_BASE		0x40
++#define XVSW_MI_MUX_VAL_MASK		0xF
++#define XVSW_MI_MUX_DISABLE_MASK	BIT(31)
++
++#define MIN_VSW_SINKS			1
++#define MAX_VSW_SINKS			16
++#define MIN_VSW_SRCS			1
++#define MAX_VSW_SRCS			16
++
++/**
++ * struct xvswitch_device - Xilinx AXI4-Stream Switch device structure
++ * @dev: Platform structure
++ * @iomem: Base address of IP
++ * @subdev: The v4l2 subdev structure
++ * @pads: media pads
++ * @routing: sink pad connected to each source pad (-1 if none)
++ * @formats: active V4L2 media bus formats on sink pads
++ * @nsinks: number of sink pads (1 to 8)
++ * @nsources: number of source pads (2 to 8)
++ * @tdest_routing: Whether TDEST routing is enabled
++ * @aclk: Video clock
++ * @saxi_ctlclk: AXI-Lite control clock
++ */
++struct xvswitch_device {
++	struct device *dev;
++	void __iomem *iomem;
++	struct v4l2_subdev subdev;
++	struct media_pad *pads;
++	int routing[MAX_VSW_SRCS];
++	struct v4l2_mbus_framefmt *formats;
++	u32 nsinks;
++	u32 nsources;
++	bool tdest_routing;
++	struct clk *aclk;
++	struct clk *saxi_ctlclk;
++};
++
++static inline struct xvswitch_device *to_xvsw(struct v4l2_subdev *subdev)
++{
++	return container_of(subdev, struct xvswitch_device, subdev);
++}
++
++static inline u32 xvswitch_read(struct xvswitch_device *xvsw, u32 addr)
++{
++	return ioread32(xvsw->iomem + addr);
++}
++
++static inline void xvswitch_write(struct xvswitch_device *xvsw, u32 addr,
++				  u32 value)
++{
++	iowrite32(value, xvsw->iomem + addr);
++}
++
++/* -----------------------------------------------------------------------------
++ * V4L2 Subdevice Video Operations
++ */
++
++static int xvsw_s_stream(struct v4l2_subdev *subdev, int enable)
++{
++	struct xvswitch_device *xvsw = to_xvsw(subdev);
++	unsigned int i;
++
++	/* Nothing to be done in case of TDEST routing */
++	if (xvsw->tdest_routing)
++		return 0;
++
++	if (!enable) {
++		/* In control reg routing, disable all master ports */
++		for (i = 0; i < xvsw->nsources; i++) {
++			xvswitch_write(xvsw, XVSW_MI_MUX_REG_BASE + (i * 4),
++				       XVSW_MI_MUX_DISABLE_MASK);
++		}
++		xvswitch_write(xvsw, XVSW_CTRL_REG, XVSW_CTRL_REG_UPDATE_MASK);
++		return 0;
++	}
++
++	/*
++	 * In case of control reg routing,
++	 * from routing table write the values into respective reg
++	 * and enable
++	 */
++	for (i = 0; i < MAX_VSW_SRCS; i++) {
++		u32 val;
++
++		if (xvsw->routing[i] != -1)
++			val = xvsw->routing[i];
++		else
++			val = XVSW_MI_MUX_DISABLE_MASK;
++
++		xvswitch_write(xvsw, XVSW_MI_MUX_REG_BASE + (i * 4),
++			       val);
++	}
++
++	xvswitch_write(xvsw, XVSW_CTRL_REG, XVSW_CTRL_REG_UPDATE_MASK);
++
++	return 0;
++}
++
++/* -----------------------------------------------------------------------------
++ * V4L2 Subdevice Pad Operations
++ */
++
++static struct v4l2_mbus_framefmt *
++xvsw_get_pad_format(struct xvswitch_device *xvsw,
++		    struct v4l2_subdev_state *sd_state,
++		    unsigned int pad, u32 which)
++{
++	switch (which) {
++	case V4L2_SUBDEV_FORMAT_TRY:
++		return v4l2_subdev_state_get_format(sd_state, pad);
++	case V4L2_SUBDEV_FORMAT_ACTIVE:
++		return &xvsw->formats[pad];
++	default:
++		return NULL;
++	}
++}
++
++static int xvsw_get_format(struct v4l2_subdev *subdev,
++			   struct v4l2_subdev_state *sd_state,
++			   struct v4l2_subdev_format *fmt)
++{
++	struct xvswitch_device *xvsw = to_xvsw(subdev);
++	int pad = fmt->pad;
++
++	/*
++	 * If control reg routing and pad is source pad then
++	 * get corresponding sink pad. if no sink pad then
++	 * clear the format and return
++	 */
++
++	if (!xvsw->tdest_routing && pad >= xvsw->nsinks) {
++		pad = xvsw->routing[pad - xvsw->nsinks];
++		if (pad < 0) {
++			memset(&fmt->format, 0, sizeof(fmt->format));
++			return 0;
++		}
++	}
++
++	fmt->format = *xvsw_get_pad_format(xvsw, sd_state, pad, fmt->which);
++
++	return 0;
++}
++
++static int xvsw_set_format(struct v4l2_subdev *subdev,
++			   struct v4l2_subdev_state *sd_state,
++			   struct v4l2_subdev_format *fmt)
++{
++	struct xvswitch_device *xvsw = to_xvsw(subdev);
++	struct v4l2_mbus_framefmt *format;
++
++	if (!xvsw->tdest_routing && fmt->pad >= xvsw->nsinks) {
++		/*
++		 * In case of control reg routing,
++		 * get the corresponding sink pad to source pad passed.
++		 *
++		 * The source pad format is always identical to the
++		 * sink pad format and can't be modified.
++		 *
++		 * If sink pad found then get_format for that pad
++		 * else clear the fmt->format as the source pad
++		 * isn't connected and return.
++		 */
++		return xvsw_get_format(subdev, sd_state, fmt);
++	}
++
++	/*
++	 * In TDEST routing mode, one can set any format on the pad as
++	 * it can't be checked which pad's data will travel to
++	 * which pad. E.g. In a system with 2 slaves and 4 masters,
++	 * S0 or S1 data can reach M0 thru M3 based on TDEST
++	 * S0 may have RBG and S1 may have YUV. M0, M1 stream RBG
++	 * and M2, M3 stream YUV based on TDEST.
++	 *
++	 * In Control reg routing mode, set format only for sink pads.
++	 */
++	format = xvsw_get_pad_format(xvsw, sd_state, fmt->pad, fmt->which);
++
++	format->code = fmt->format.code;
++	format->width = clamp_t(unsigned int, fmt->format.width,
++				XVIP_MIN_WIDTH, XVIP_MAX_WIDTH);
++	format->height = clamp_t(unsigned int, fmt->format.height,
++				 XVIP_MIN_HEIGHT, XVIP_MAX_HEIGHT);
++	format->field = V4L2_FIELD_NONE;
++	format->colorspace = V4L2_COLORSPACE_SRGB;
++
++	fmt->format = *format;
++
++	return 0;
++}
++
++static int xvsw_open(struct v4l2_subdev *subdev, struct v4l2_subdev_fh *fh)
++{
++	return 0;
++}
++
++static int xvsw_close(struct v4l2_subdev *subdev, struct v4l2_subdev_fh *fh)
++{
++	return 0;
++}
++
++static const struct v4l2_subdev_video_ops xvsw_video_ops = {
++	.s_stream = xvsw_s_stream,
++};
++
++static const struct v4l2_subdev_pad_ops xvsw_pad_ops = {
++	.enum_mbus_code = xvip_enum_mbus_code,
++	.enum_frame_size = xvip_enum_frame_size,
++	.get_fmt = xvsw_get_format,
++	.set_fmt = xvsw_set_format,
++};
++
++static const struct v4l2_subdev_ops xvsw_ops = {
++	.video = &xvsw_video_ops,
++	.pad = &xvsw_pad_ops,
++};
++
++static const struct v4l2_subdev_internal_ops xvsw_internal_ops = {
++	.open = xvsw_open,
++	.close = xvsw_close,
++};
++
++/* -----------------------------------------------------------------------------
++ * Media Operations
++ */
++
++static bool xvsw_has_route(struct media_entity *entity, unsigned int pad0,
++			   unsigned int pad1)
++{
++	struct xvswitch_device *xvsw =
++		container_of(entity, struct xvswitch_device, subdev.entity);
++	unsigned int sink0, sink1;
++
++	/* Two sinks are never connected together. */
++	if (pad0 < xvsw->nsinks && pad1 < xvsw->nsinks)
++		return false;
++
++	/* In TDEST routing, assume all sinks and sources are connected */
++	if (xvsw->tdest_routing)
++		return true;
++
++	sink0 = pad0 < xvsw->nsinks ? pad0 : xvsw->routing[pad0 - xvsw->nsinks];
++	sink1 = pad1 < xvsw->nsinks ? pad1 : xvsw->routing[pad1 - xvsw->nsinks];
++
++	return sink0 == sink1;
++}
++
++static const struct media_entity_operations xvsw_media_ops = {
++	.link_validate = v4l2_subdev_link_validate,
++	.has_route = xvsw_has_route,
++};
++
++/* -----------------------------------------------------------------------------
++ * Platform Device Driver
++ */
++
++static int xvsw_parse_of(struct xvswitch_device *xvsw)
++{
++	struct device_node *node = xvsw->dev->of_node;
++	struct device_node *ports;
++	struct device_node *port;
++	unsigned int nports = 0;
++	u32 routing_mode;
++	int ret;
++
++	printk("Dummy switch driver parsing...\n");
++
++	ret = of_property_read_u32(node, "xlnx,num-si-slots", &xvsw->nsinks);
++	if (ret < 0 || xvsw->nsinks < MIN_VSW_SINKS ||
++	    xvsw->nsinks > MAX_VSW_SINKS) {
++		dev_err(xvsw->dev, "missing or invalid xlnx,num-si-slots property\n");
++		return ret;
++	}
++
++	ret = of_property_read_u32(node, "xlnx,num-mi-slots", &xvsw->nsources);
++	if (ret < 0 || xvsw->nsources < MIN_VSW_SRCS ||
++	    xvsw->nsources > MAX_VSW_SRCS) {
++		dev_err(xvsw->dev, "missing or invalid xlnx,num-mi-slots property\n");
++		return ret;
++	}
++
++	ret = of_property_read_u32(node, "xlnx,routing-mode", &routing_mode);
++	if (ret < 0 || routing_mode < 0 || routing_mode > 1) {
++		dev_err(xvsw->dev, "missing or invalid xlnx,routing property\n");
++		return ret;
++	}
++
++	if (!routing_mode)
++		xvsw->tdest_routing = true;
++
++	xvsw->aclk = devm_clk_get(xvsw->dev, "aclk");
++	if (IS_ERR(xvsw->aclk)) {
++		ret = PTR_ERR(xvsw->aclk);
++		dev_err(xvsw->dev, "failed to get ap_clk (%d)\n", ret);
++		return ret;
++	}
++
++	if (!xvsw->tdest_routing) {
++		xvsw->saxi_ctlclk = devm_clk_get(xvsw->dev,
++						 "s_axi_ctl_clk");
++		if (IS_ERR(xvsw->saxi_ctlclk)) {
++			ret = PTR_ERR(xvsw->saxi_ctlclk);
++			dev_err(xvsw->dev,
++				"failed to get s_axi_ctl_clk (%d)\n",
++				ret);
++			return ret;
++		}
++	}
++
++	if (xvsw->tdest_routing && xvsw->nsinks > 1) {
++		dev_err(xvsw->dev, "sinks = %d. Driver Limitation max 1 sink in TDEST routing mode\n",
++			xvsw->nsinks);
++		return -EINVAL;
++	}
++
++	ports = of_get_child_by_name(node, "ports");
++	if (!ports)
++		ports = node;
++
++	for_each_child_of_node_scoped(ports, port) {
++		struct device_node *endpoint;
++
++		if (!port->name || of_node_cmp(port->name, "port"))
++			continue;
++
++		endpoint = of_get_next_child(port, NULL);
++		if (!endpoint) {
++			dev_err(xvsw->dev, "No port at\n");
++			return -EINVAL;
++		}
++
++		/* Count the number of ports. */
++		nports++;
++	}
++
++	/* validate number of ports */
++	if (nports != (xvsw->nsinks + xvsw->nsources)) {
++		dev_err(xvsw->dev, "invalid number of ports %u\n", nports);
++		return -EINVAL;
++	}
++
++	printk("Dummy switch driver parse success!\n");
++
++	return 0;
++}
++
++static int xvsw_probe(struct platform_device *pdev)
++{
++	struct v4l2_subdev *subdev;
++	struct xvswitch_device *xvsw;
++	struct resource *res;
++	unsigned int npads;
++	unsigned int i, padcount;
++	int ret;
++
++	printk("Dummy switch driver probing...\n");
++
++	xvsw = devm_kzalloc(&pdev->dev, sizeof(*xvsw), GFP_KERNEL);
++	if (!xvsw)
++		return -ENOMEM;
++
++	xvsw->dev = &pdev->dev;
++
++	ret = xvsw_parse_of(xvsw);
++	if (ret < 0)
++		return ret;
++
++	/* ioremap only if control reg based routing */
++	if (!xvsw->tdest_routing) {
++		res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++		xvsw->iomem = devm_ioremap_resource(xvsw->dev, res);
++		if (IS_ERR(xvsw->iomem))
++			return PTR_ERR(xvsw->iomem);
++	}
++
++	/*
++	 * Initialize V4L2 subdevice and media entity. Pad numbers depend on the
++	 * number of pads.
++	 */
++	npads = xvsw->nsinks + xvsw->nsources;
++	xvsw->pads = devm_kzalloc(&pdev->dev, npads * sizeof(*xvsw->pads),
++				  GFP_KERNEL);
++	if (!xvsw->pads)
++		return -ENOMEM;
++
++	for (i = 0; i < xvsw->nsinks; ++i)
++		xvsw->pads[i].flags = MEDIA_PAD_FL_SINK;
++
++	for (; i < npads; ++i)
++		xvsw->pads[i].flags = MEDIA_PAD_FL_SOURCE;
++
++	padcount = xvsw->tdest_routing ? npads : xvsw->nsinks;
++
++	/*
++	 * In case of tdest routing, allocate format per pad.
++	 * source pad format has to match one of the sink pads in tdest routing.
++	 *
++	 * Otherwise only allocate for sinks as sources will
++	 * get the same pad format and corresponding sink.
++	 * set format on src pad will return corresponding sinks data.
++	 */
++	xvsw->formats = devm_kzalloc(&pdev->dev,
++				     padcount * sizeof(*xvsw->formats),
++				     GFP_KERNEL);
++	if (!xvsw->formats) {
++		dev_err(xvsw->dev, "No memory to allocate formats!\n");
++		return -ENOMEM;
++	}
++
++	for (i = 0; i < padcount; i++) {
++		xvsw->formats[i].code = MEDIA_BUS_FMT_RGB888_1X24;
++		xvsw->formats[i].field = V4L2_FIELD_NONE;
++		xvsw->formats[i].colorspace = V4L2_COLORSPACE_SRGB;
++		xvsw->formats[i].width = XVIP_MAX_WIDTH;
++		xvsw->formats[i].height = XVIP_MAX_HEIGHT;
++	}
++
++	/*
++	 * Initialize the routing table if none are connected.
++	 * Routing table is valid only incase routing is not TDEST based.
++	 */
++	for (i = 0; i < MAX_VSW_SRCS; ++i)
++		xvsw->routing[i] = -1;
++
++	ret = clk_prepare_enable(xvsw->aclk);
++	if (ret) {
++		dev_err(&pdev->dev, "failed to enable aclk (%d)\n",
++			ret);
++		return ret;
++	}
++
++	if (!xvsw->tdest_routing) {
++		ret = clk_prepare_enable(xvsw->saxi_ctlclk);
++		if (ret) {
++			dev_err(&pdev->dev,
++				"failed to enable s_axi_ctl_clk (%d)\n",
++				ret);
++			clk_disable_unprepare(xvsw->aclk);
++			return ret;
++		}
++	}
++
++	subdev = &xvsw->subdev;
++	v4l2_subdev_init(subdev, &xvsw_ops);
++	subdev->dev = &pdev->dev;
++	subdev->internal_ops = &xvsw_internal_ops;
++	strscpy(subdev->name, dev_name(&pdev->dev), sizeof(subdev->name));
++	v4l2_set_subdevdata(subdev, xvsw);
++	subdev->flags |= V4L2_SUBDEV_FL_HAS_DEVNODE;
++	subdev->entity.ops = &xvsw_media_ops;
++
++	ret = media_entity_pads_init(&subdev->entity, npads, xvsw->pads);
++	if (ret < 0)
++		goto clk_error;
++
++	platform_set_drvdata(pdev, xvsw);
++
++	ret = v4l2_async_register_subdev(subdev);
++	if (ret < 0) {
++		dev_err(&pdev->dev, "failed to register subdev\n");
++		goto error;
++	}
++
++	dev_info(xvsw->dev, "Xilinx AXI4-Stream Switch found!\n");
++
++	printk("Dummy switch driver probe success!\n");
++	return 0;
++
++error:
++	media_entity_cleanup(&subdev->entity);
++clk_error:
++	if (!xvsw->tdest_routing)
++		clk_disable_unprepare(xvsw->saxi_ctlclk);
++	clk_disable_unprepare(xvsw->aclk);
++	return ret;
++}
++
++static void xvsw_remove(struct platform_device *pdev)
++{
++	struct xvswitch_device *xvsw = platform_get_drvdata(pdev);
++	struct v4l2_subdev *subdev = &xvsw->subdev;
++
++	v4l2_async_unregister_subdev(subdev);
++	media_entity_cleanup(&subdev->entity);
++	if (!xvsw->tdest_routing)
++		clk_disable_unprepare(xvsw->saxi_ctlclk);
++	clk_disable_unprepare(xvsw->aclk);
++}
++
++static const struct of_device_id dummy_switch_of_id_table[] = {
++	{ .compatible = "xlnx,dummy_switch-1.0" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, dummy_switch_of_id_table);
++
++static struct platform_driver dummy_switch_driver = {
++	.driver = {
++		.name		= "xilinx-dummy_switch",
++		.of_match_table	= dummy_switch_of_id_table,
++	},
++	.probe			= xvsw_probe,
++	.remove			= xvsw_remove,
++};
++
++module_platform_driver(dummy_switch_driver);
++
++MODULE_AUTHOR("Vishal Sagar <vishal.sagar@xilinx.com>");
++MODULE_DESCRIPTION("Xilinx AXI4-Stream Switch Driver");
+-- 
+2.44.1
+

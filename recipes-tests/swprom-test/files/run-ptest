@@ -1,0 +1,10 @@
+#!/bin/sh
+# Copyright © Advanced Micro Devices, Inc., or its affiliates. All rights reserved.
+# SPDX-License-Identifier: MIT
+# Contributors: IC
+# Maintainer: KC
+
+set -e
+
+echo "Running 1-w prom ptest"
+python3 swprom.py

@@ -1,0 +1,16 @@
+# Copyright © Advanced Micro Devices, Inc., or its affiliates. All rights reserved.
+# SPDX-License-Identifier: MIT
+# Contributors: KC, JC
+# Maintainer: KC
+
+# Description: Creates a partitioned SD card image. Boot files
+# are located in the first vfat partition. Rootfs will be in second ext4 partition.
+
+# This wks uses a fixed-size /boot parition.  512MiB was selected as it should be large enough
+# for most reference systems and their included bitstreams, while allowing additional space
+# for user data or on-target upgrades.  To adjust the size of the /boot parition change the
+# value of --fixed-size below.  See the Yocto Project WIC documentation for more information.
+bootloader --ptable gpt
+# Keep FAT logical sector size at 512B for U-Boot filesystem loader compatibility.
+part  /boot  --source rootfs --change-directory=boot  --fixed-size=512M  --fstype=vfat  --mkfs-extraopts "-F 32 -S 512"  --use-label  --label dom0boot  --align 4 --uuid 377ecac0-4852-11f0-84d2-325096b39f47
+part  /      --source rootfs --exclude-path=boot/                        --fstype=ext4  --use-label  --label root            --align 4 --uuid 377ec80e-4852-11f0-9688-325096b39f47

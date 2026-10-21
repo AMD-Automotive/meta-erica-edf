@@ -1,0 +1,17 @@
+#!/bin/bash
+# Copyright © Advanced Micro Devices, Inc., or its affiliates. All rights reserved.
+# SPDX-License-Identifier: MIT
+# Contributors: KC
+# Maintainer: KC
+
+echo "Mounting guest fat partition and copying Linux kernel"
+mkdir -p /root/xenmount
+mount /dev/sda3 /root/xenmount
+cp /root/xenmount/Image /root
+umount /root/xenmount
+rm -rf /root/xenmount
+echo "done - launching guest"
+
+xl create -c /etc/xen/guest0.cfg
+
+

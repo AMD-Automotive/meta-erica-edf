@@ -1,0 +1,79 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Brian Wiec <brian.wiec@amd.com>
+Date: Wed, 11 Jun 2025 00:00:00 +0000
+Subject: [PATCH] media: vivid: force non-coherent CMA buffers for dma-contig
+ allocator
+
+When vivid uses the dma-contig allocator (allocators=1), its buffers
+must be allocated from CMA and mapped uncached so that an external agent
+reading DDR directly (e.g. ep_proxy's physical-address discovery via
+/dev/mem) can observe CPU writes to the buffer.
+
+On Versal, the default CMA pool lives at 0x800000000 (above 4GB).
+The stock 32-bit DMA mask causes dma_alloc_coherent() to reject CMA
+pages that fail the mask check, falling back to non-CMA upper DDR --
+outside the region ep_proxy scans.  Additionally, the coherent
+interconnect makes dma_alloc_coherent() return write-back cached
+mappings, so CPU writes sit in cache and are invisible to uncached
+/dev/mem reads.
+
+Fix both issues:
+  1. Widen the DMA mask to 64 bits so the high CMA pool is reachable.
+  2. Set DMA_ATTR_FORCE_CONTIGUOUS on the vb2 queue to route
+     allocations through CMA explicitly.
+  3. Mark the device non-coherent so the DMA direct path produces
+     uncached mappings that are visible to /dev/mem.
+
+This matches the buffer properties of the real Xilinx VIPP/ISP
+pipeline that ep_proxy was designed against.
+
+Signed-off-by: Brian Wiec <brian.wiec@amd.com>
+---
+ drivers/media/test-drivers/vivid/vivid-core.c | 18 ++++++++++++++++--
+ 1 file changed, 16 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/media/test-drivers/vivid/vivid-core.c b/drivers/media/test-drivers/vivid/vivid-core.c
+--- a/drivers/media/test-drivers/vivid/vivid-core.c
++++ b/drivers/media/test-drivers/vivid/vivid-core.c
+@@ -15,6 +15,7 @@
+ #include <linux/vmalloc.h>
+ #include <linux/font.h>
+ #include <linux/mutex.h>
++#include <linux/dma-map-ops.h>
+ #include <linux/platform_device.h>
+ #include <linux/videodev2.h>
+ #include <linux/v4l2-dv-timings.h>
+@@ -923,6 +924,10 @@
+ 	q->ops = ops;
+ 	q->mem_ops = allocators[dev->inst] == 1 ? &vb2_dma_contig_memops :
+ 						  &vb2_vmalloc_memops;
++	/* Route dma-contig allocations through CMA so buffers land in the
++	 * CMA window that ep_proxy scans for physical-address discovery. */
++	if (allocators[dev->inst] == 1)
++		q->dma_attrs |= DMA_ATTR_FORCE_CONTIGUOUS;
+ 	q->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
+ 	q->min_reqbufs_allocation = min_reqbufs_allocation;
+ 	q->lock = &dev->mutex;
+@@ -1972,8 +1977,17 @@
+
+ 	spin_lock_init(&dev->cec_xfers_slock);
+
+-	if (allocators[inst] == 1)
+-		dma_coerce_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32));
++	if (allocators[inst] == 1) {
++		/* 64-bit mask so the high CMA pool (0x800000000) is reachable;
++		 * under the stock 32-bit mask, CMA pages fail the mask check
++		 * and the allocator falls back to non-CMA upper DDR. */
++		dma_coerce_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64));
++		/* Force non-coherent (uncached) buffers so an external agent
++		 * reading DDR directly (ep_proxy /dev/mem scan) sees CPU
++		 * writes.  Real VIPP/ISP pipeline buffers are uncached; vivid
++		 * defaults to coherent/cached, which breaks that assumption. */
++		pdev->dev.dma_coherent = false;
++	}
+
+ 	ret = vivid_create_queues(dev);
+ 	if (ret)
+--
+2.39.2
+

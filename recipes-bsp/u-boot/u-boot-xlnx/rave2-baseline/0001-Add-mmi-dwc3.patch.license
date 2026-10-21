@@ -1,0 +1,7 @@
+SPDX-FileCopyrightText: Copyright © Advanced Micro Devices, Inc., or its affiliates. All rights reserved.
+SPDX-FileContributor: KC
+# Maintainer: KC
+# Provenance: AMD-authored modification to U-Boot drivers/usb/dwc3/dwc3-generic.c
+# Upstream target SPDX expression: GPL-2.0; represented by its canonical SPDX equivalent below
+
+SPDX-License-Identifier: GPL-2.0-only

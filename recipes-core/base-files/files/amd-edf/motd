@@ -1,0 +1,18 @@
+ERICA is built using the AMD Embedded Development Framework - a reference Yocto 
+Project distribution that should be used for testing and development purposes only.
+It is recommended that you create your own distribution for production use.
+
+/AMD/Systems-Engineering/Project-ERICA/
+                                                                ##################
+        ###          #####         ####    ############          #################
+       #####         ######       #####    ####    ######          ###############
+      ### ###        ########   #######    ####       #####                  #####
+     ###   ###       #### #############    ####        ####        #         #####
+    ###     ###      ####   #####  ####    ####        ####      ###         #####
+   ###      ####     ####    ###   ####    ####        ####    #####         #####
+  ###############    ####          ####    ####       #####   ######         #####
+ ####         ####   ####          ####    ####    ######     ############    ####
+####           ####  ####          ####    ############       ##########        ##
+                                                              ########
+              Embedded Robotics for Intelligent, Connected Autonomy
+

@@ -1,0 +1,7 @@
+SPDX-FileCopyrightText: Copyright © Advanced Micro Devices, Inc., or its affiliates. All rights reserved.
+SPDX-FileContributor: BW
+# Maintainer: BW
+# Provenance: AMD-authored modification to Linux drivers/media/test-drivers/vivid
+# Upstream target license: GPL-2.0-only
+
+SPDX-License-Identifier: GPL-2.0-only

@@ -1,0 +1,21 @@
+#!/bin/sh
+# Copyright © Advanced Micro Devices, Inc., or its affiliates. All rights reserved.
+# SPDX-License-Identifier: MIT
+# Contributors: KC
+# Maintainer: KC
+
+set -e
+
+: "${IPERF10_SERVER:=192.168.1.101}"
+: "${IPERF10_IFACE:=eth1}"
+: "${IPERF10_MIN_BW:=9000}"
+
+echo "Running iperf 10G ptest"
+echo "  IPERF10_SERVER=$IPERF10_SERVER"
+echo "  IPERF10_IFACE=$IPERF10_IFACE"
+echo "  IPERF10_MIN_BW=$IPERF10_MIN_BW"
+
+export IPERF10_SERVER IPERF10_SERVER IPERF10_IFACE IPERF10_MIN_BW
+
+python3 "$(dirname "$0")/iperf10g.py"
+exit $?

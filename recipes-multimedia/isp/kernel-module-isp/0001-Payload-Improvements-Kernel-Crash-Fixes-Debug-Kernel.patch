@@ -1,0 +1,642 @@
+From 3604cfdf098c1b04f562d968779dacabce5039c3 Mon Sep 17 00:00:00 2001
+From: LT Thomas <lthomas@amd.com>
+Date: Tue, 7 Jul 2026 08:34:08 -0700
+Subject: [PATCH] Payload Improvements Kernel Crash Fixes Debug Kernel Params
+
+---
+ visp/include/kmbox.h         |   2 +
+ visp/visp_app.c              |  48 ++++++++++++++++
+ visp/visp_driver.c           |  12 +++-
+ visp_mbox/mailbox/mbox_cmd.c |  91 +++++++++++++++++++++++++++---
+ visp_mbox/visp_mbox_driver.c | 105 ++++++++++++++++++++++++++---------
+ visp_mbox/visp_mbox_driver.h |  16 +++++-
+ 6 files changed, 236 insertions(+), 38 deletions(-)
+
+diff --git a/visp/include/kmbox.h b/visp/include/kmbox.h
+index 9a069fb..a802ec8 100755
+--- a/visp/include/kmbox.h
++++ b/visp/include/kmbox.h
+@@ -56,6 +56,8 @@
+ #define __KMBOX__
+ uint8_t xlnx_mbox_apu_wait_for_data(struct visp_dev *isp_dev, void *data);
+ uint8_t xlnx_mbox_apu_wait_for_ack(struct visp_dev *isp_dev);
++uint8_t xlnx_mbox_apu_wait_for_ack_cookie(struct visp_dev *isp_dev,
++					     uint32_t expected_cookie);
+ int send_command(mb_cmd_id_e cmd, void *data, uint32_t size, uint8_t dest_cpu,
+ 				 uint8_t src_cpu);
+ #endif
+diff --git a/visp/visp_app.c b/visp/visp_app.c
+index d37e20b..573109f 100644
+--- a/visp/visp_app.c
++++ b/visp/visp_app.c
+@@ -1435,6 +1435,7 @@ int media_isp_device_sensor_open(struct visp_dev *isp_dev, uint8_t port)
+ 	uint8_t mode_index = 0;
+ 	char sensor_name[MEDIA_ISP_CHAR_LENGTH_MAX];
+ 	cam_device_sensor_test_pattern_t test_pattern;
++	ktime_t t_mark;
+ 
+ 	memset(sensor_name, 0, sizeof(sensor_name));
+ 
+@@ -1445,8 +1446,12 @@ int media_isp_device_sensor_open(struct visp_dev *isp_dev, uint8_t port)
+ 		return ret_val;
+ 	}
+ 
++	t_mark = ktime_get();
+ 	ret_val = vsi_cam_device_sensor_open(
+ 	    isp_dev, isp_port->cam_device_handle, (uint32_t)mode_index);
++	dev_info(isp_dev->dev,
++		 "[TIMING]     vsi_cam_device_sensor_open took %lld ms\n",
++		 ktime_ms_delta(ktime_get(), t_mark));
+ 	if (ret_val != VSI_SUCCESS) {
+ 		dev_err(
+ 		    isp_dev->dev,
+@@ -1456,8 +1461,12 @@ int media_isp_device_sensor_open(struct visp_dev *isp_dev, uint8_t port)
+ 	}
+ 
+ 	test_pattern.enable = false;
++	t_mark = ktime_get();
+ 	ret_val = vsi_cam_device_sensor_set_test_pattern(
+ 	    isp_dev, isp_port->cam_device_handle, &test_pattern);
++	dev_info(isp_dev->dev,
++		 "[TIMING]     sensor_set_test_pattern took %lld ms\n",
++		 ktime_ms_delta(ktime_get(), t_mark));
+ 	if (ret_val != VSI_SUCCESS) {
+ 		dev_err(isp_dev->dev,
+ 			"CamDevice set sensor %s test_pattern false Failed, "
+@@ -1595,8 +1604,13 @@ int media_isp_device_camera_connect(struct visp_dev *isp_dev, uint8_t index)
+ 	media_isp_port_attr *isp_port = &isp_dev->isp_ports[port];
+ 	int ret_val = VSI_SUCCESS;
+ 	cam_device_pipe_submodule_ctrl_u sub_module_init;
++	ktime_t t_mark;
+ 
++	t_mark = ktime_get();
+ 	ret_val = media_isp_device_sensor_open(isp_dev, port);
++	dev_info(isp_dev->dev,
++		 "[TIMING]   sensor_open took %lld ms\n",
++		 ktime_ms_delta(ktime_get(), t_mark));
+ 	if (ret_val != VSI_SUCCESS) {
+ 		dev_err(isp_dev->dev,
+ 			"port %d chn %d open sensor failed, ret is %d", port,
+@@ -1605,7 +1619,11 @@ int media_isp_device_camera_connect(struct visp_dev *isp_dev, uint8_t index)
+ 	}
+ 
+ 	if (isp_dev->ports_mask != 0x01) {
++		t_mark = ktime_get();
+ 		ret_val = media_isp_device_mcm_init(isp_dev, port);
++		dev_info(isp_dev->dev,
++			 "[TIMING]   mcm_init took %lld ms\n",
++			 ktime_ms_delta(ktime_get(), t_mark));
+ 		if (ret_val != VSI_SUCCESS) {
+ 			dev_err(isp_dev->dev,
+ 				" port %d chn %d init mcm failed, ret is %d",
+@@ -1616,8 +1634,12 @@ int media_isp_device_camera_connect(struct visp_dev *isp_dev, uint8_t index)
+ 
+ 	memset(&sub_module_init, 0, sizeof(sub_module_init));
+ 
++	t_mark = ktime_get();
+ 	ret_val =
+ 	    media_isp_device_sub_module_init(isp_dev, port, &sub_module_init);
++	dev_info(isp_dev->dev,
++		 "[TIMING]   sub_module_init took %lld ms\n",
++		 ktime_ms_delta(ktime_get(), t_mark));
+ 	if (ret_val != VSI_SUCCESS) {
+ 		dev_err(isp_dev->dev,
+ 			" port %d chn %d init submodule failed, ret is %d",
+@@ -1625,8 +1647,12 @@ int media_isp_device_camera_connect(struct visp_dev *isp_dev, uint8_t index)
+ 		goto ERR_TO_TERMINATE_MCM;
+ 	}
+ 
++	t_mark = ktime_get();
+ 	ret_val = vsi_cam_device_connect_camera(
+ 	    isp_dev, isp_port->cam_device_handle, &sub_module_init);
++	dev_info(isp_dev->dev,
++		 "[TIMING]   connect_camera took %lld ms\n",
++		 ktime_ms_delta(ktime_get(), t_mark));
+ 	if (ret_val != VSI_SUCCESS) {
+ 		dev_err(isp_dev->dev,
+ 			"CamDevice camera connect failed, ret is %d", ret_val);
+@@ -2020,6 +2046,7 @@ int isp_device_create(struct visp_dev *isp_dev, uint8_t port)
+ 	cam_device_sensor_drv_cfg_t devSensorDrv = {NULL, 0};
+ 	char sensor_name[MEDIA_ISP_CHAR_LENGTH_MAX];
+ 	hal_i2c_config_t hal_i2c_config;
++	ktime_t t_mark;
+ 
+ 	/*Enter port Level Critical Section */
+ 
+@@ -2107,6 +2134,7 @@ int isp_device_create(struct visp_dev *isp_dev, uint8_t port)
+ 	dev_info(
+ 	    isp_dev->dev,
+ 	    "Registering the SensorDrvHandle, this can take some time...\n");
++	t_mark = ktime_get();
+ 	ret_val = vsi_cam_device_sensor_drv_handle_register(
+ 	    isp_dev, isp_port->cam_device_handle, &devSensorDrv);
+ 	if (ret_val != VSI_SUCCESS) {
+@@ -2116,6 +2144,9 @@ int isp_device_create(struct visp_dev *isp_dev, uint8_t port)
+ 		ret_val = VSI_ERR_TIMEOUT;
+ 		goto ERR_TO_DESTROY_CAMDEVICE_HANDLE;
+ 	}
++	dev_info(isp_dev->dev,
++		 "[TIMING] SensorDrvHandle register took %lld ms\n",
++		 ktime_ms_delta(ktime_get(), t_mark));
+ 
+ 	kfree(devSensorDrv.sensor_drv_handle);
+ 
+@@ -2191,11 +2222,16 @@ void visp_setup_isp_pipeline(struct visp_dev *isp_dev, uint32_t pad)
+ 	int port = pad / MEDIA_ISP_PORT_PAD_COUNT;
+ 	int chn = (pad % MEDIA_ISP_PORT_PAD_COUNT) - 1;
+ 	int ret = 0;
++	ktime_t t_mark;
+ 
+ 	mutex_lock(&isp_dev->rpu->rpu_lock);
+ 	/* Try to create ISP device if not already created */
+ 	if (!isp_dev->isp_ports[port].cam_device_handle) {
++		t_mark = ktime_get();
+ 		ret = isp_device_create(isp_dev, port);
++		dev_info(isp_dev->dev,
++			 "[TIMING] isp_device_create took %lld ms\n",
++			 ktime_ms_delta(ktime_get(), t_mark));
+ 		if (ret) {
+ 			/* If device creation fails, continue with basic enumeration */
+ 			dev_err(isp_dev->dev,
+@@ -2209,7 +2245,11 @@ void visp_setup_isp_pipeline(struct visp_dev *isp_dev, uint32_t pad)
+ 	/*perform camera or filter configuration if not already done*/
+ 	if (isp_dev->isp_ports[port].camera_connect_ref_cnt == 0) {
+ #ifdef LOAD_CALIB_ENABLE
++		t_mark = ktime_get();
+ 		ret = visp_l_calib_event(isp_dev, pad);
++		dev_info(isp_dev->dev,
++			 "[TIMING] load calib (visp_l_calib_event) took %lld ms\n",
++			 ktime_ms_delta(ktime_get(), t_mark));
+ 		if (ret != 0 && ret != -EPIPE) {
+ 			dev_err(isp_dev->dev, "[EVENT_FAIL] %s %d isp:%d port:%d\n",
+ 				__func__, __LINE__, isp_dev->id, port);
+@@ -2222,7 +2262,11 @@ void visp_setup_isp_pipeline(struct visp_dev *isp_dev, uint32_t pad)
+ 		}
+ #endif
+ 
++		t_mark = ktime_get();
+ 		ret = media_isp_device_camera_connect(isp_dev, pad);
++		dev_info(isp_dev->dev,
++			 "[TIMING] camera_connect took %lld ms\n",
++			 ktime_ms_delta(ktime_get(), t_mark));
+ 		if (ret != 0) {
+ 			dev_err(isp_dev->dev,
+ 				"%s %d FAiled camera connect\n",
+@@ -2233,7 +2277,11 @@ void visp_setup_isp_pipeline(struct visp_dev *isp_dev, uint32_t pad)
+ 		isp_dev->isp_ports[port].camera_connect_ref_cnt++;
+ 
+ #ifdef LOAD_CALIB_ENABLE
++		t_mark = ktime_get();
+ 		ret = visp_l_json_event(isp_dev, pad);
++		dev_info(isp_dev->dev,
++			 "[TIMING] load JSON/3A (visp_l_json_event) took %lld ms\n",
++			 ktime_ms_delta(ktime_get(), t_mark));
+ 		if (ret != 0 && ret != -EPIPE) {
+ 			dev_err(isp_dev->dev, "[EVENT_FAIL] %s %d isp:%d port:%d\n",
+ 				__func__, __LINE__, isp_dev->id, port);
+diff --git a/visp/visp_driver.c b/visp/visp_driver.c
+index 0a6de64..e9c65d5 100644
+--- a/visp/visp_driver.c
++++ b/visp/visp_driver.c
+@@ -827,7 +827,7 @@ static int handle_frameout_buffer(struct visp_dev *isp_dev)
+ 	struct Chn_info info;
+ 	mbox_post_msg *msg;
+ 	size_t size;
+-	void *packet_from_rpu;
++	void *packet_from_rpu = NULL;
+ 	uint8_t buf_index;
+ 	int pad = -1;
+ 	int ret_val = 0;
+@@ -861,11 +861,15 @@ static int handle_frameout_buffer(struct visp_dev *isp_dev)
+ 	packet_from_rpu = kzalloc(size, GFP_KERNEL);
+ 	if (!packet_from_rpu) {
+ 		dev_err(isp_dev->dev, "Failed to allocate packet_from_rpu\n");
++		kfree(msg);
+ 		return -ENOMEM;
+ 	}
+ 
+ 	memcpy(packet_from_rpu, msg->payload, size);
+ 
++	/* Free the dequeued message structure (allocated on enqueue) */
++	kfree(msg);
++
+ 	/*
+ 	 * One-shot payload hexdump (controlled by /sys/module/visp/parameters/
+ 	 * dump_dq_payload). Used to locate where the firmware places
+@@ -935,7 +939,8 @@ static int handle_frameout_buffer(struct visp_dev *isp_dev)
+ 	if (!output_buffer) {
+ 		dev_err(isp_dev->dev,
+ 			"handle_frameout_buffer: Outputbuffer is NULL...!\n");
+-		return -EINVAL;
++		ret_val = -EINVAL;
++		goto error_free_buf;
+ 	}
+ 
+ 	/* Calculate the pad index */
+@@ -974,7 +979,8 @@ static int handle_frameout_buffer(struct visp_dev *isp_dev)
+ 	return 0;
+ 
+ error_free_buf:
+-	/* Free buffer in case of any error*/
++
++	kfree(packet_from_rpu);
+ 	return ret_val;
+ }
+ 
+diff --git a/visp_mbox/mailbox/mbox_cmd.c b/visp_mbox/mailbox/mbox_cmd.c
+index 3b5dba4..3659f62 100644
+--- a/visp_mbox/mailbox/mbox_cmd.c
++++ b/visp_mbox/mailbox/mbox_cmd.c
+@@ -55,6 +55,7 @@
+ #include "mbox_cmd.h"
+ #include "mbox_api.h"
+ #include "mbox_error_code.h"
++#include <linux/delay.h>
+ #include <linux/gfp.h>
+ #include <linux/kernel.h>
+ #include <linux/module.h>
+@@ -82,6 +83,27 @@
+ uint32_t flag;
+ #define DEBUG_ENABLE_LOG
+ 
++/*
++ * Delay (in usec) before re-arming RX after command responses.
++ * This intentionally slows RPU->APU response bursts so the APU-side
++ * response handling path has time to consume queued entries.
+++ * Set to 0 to disable (recommended for fast sensor setup).
+++ * Set to 10-50 for gentle pacing without dropping burst responses.
+++ */
++static unsigned int visp_rsp_rearm_delay_us = 0;
++module_param_named(rsp_rearm_delay_us, visp_rsp_rearm_delay_us, uint, 0644);
++MODULE_PARM_DESC(rsp_rearm_delay_us,
++		 "Delay (usec) before RX re-arm for MB_CMD_RES/GET_SUCCESS (0=disabled)");
++
++/*
++ * Verbose mailbox cookie tracing. Defaults to off; enable at runtime with:
++ *   echo 1 > /sys/module/visp_mbox/parameters/mbox_debug
++ */
++unsigned int visp_mbox_debug;
++module_param_named(mbox_debug, visp_mbox_debug, uint, 0644);
++MODULE_PARM_DESC(mbox_debug,
++		 "Enable verbose mailbox cookie tracing (0=off, 1=on)");
++
+ struct response_packet {
+ 	u32 cmdid;
+ 	u32 cookie;
+@@ -147,6 +169,7 @@ int visp_mbox_apu_read(struct rpu_dev *rpu)
+ 	struct visp_dev *isp_dev;
+ 	uint32_t cmd, isp_id;
+ 	int ret = 0;
++	bool throttle_response_rearm = false;
+ 
+ 	if (vpi_mbox_is_empty(rpu->apu_rx_ctrl, rpu->core_id, MBOX_CORE_APU)) {
+ 		if (mutex_is_locked(&rpu->write_lock)) {
+@@ -179,10 +202,26 @@ int visp_mbox_apu_read(struct rpu_dev *rpu)
+ 	}
+ 
+ 	cmd = rpu->msg->msg_id;
++	throttle_response_rearm =
++		(cmd == MB_CMD_RES_SUCCESS || cmd == MB_CMD_GET_SUCCESS);
++
++	mbox_dbg("[MBOX_DEBUG] RPU->APU recv: cmd_id=%u, cookie=%u, isp_id=%u, ack_flag=%d, data_flag=%d, app_wait=%d, rpu_id=%d\n",
++		cmd, ((payload_packet *)rpu->msg->payload)->cookie, isp_id,
++		isp_dev->k_apu_ack_flag, isp_dev->k_apu_data_flag,
++		rpu->app_wait_flag, rpu->rpu_id);
++
+ 	/* Handle specific commands */
+ 	if (isp_dev->k_apu_ack_flag && cmd == MB_CMD_RES_SUCCESS) {
+-		if (!kfifo_in(&rpu->ack_fifo, &rpu->msg, 1)) {
++		mbox_post_msg *msg_copy = kmalloc(sizeof(*rpu->msg), GFP_ATOMIC);
++		if (!msg_copy) {
++			pr_err("Failed to allocate ack message copy\n");
++			ret = -ENOMEM;
++			goto ERROR;
++		}
++		memcpy(msg_copy, rpu->msg, sizeof(*rpu->msg));
++		if (!kfifo_in(&rpu->ack_fifo, &msg_copy, 1)) {
+ 			pr_err("Failed to queue into apu ack kfifo\n");
++			kfree(msg_copy);
+ 			ret = -ENOMEM;
+ 			goto ERROR;
+ 		}
+@@ -190,28 +229,60 @@ int visp_mbox_apu_read(struct rpu_dev *rpu)
+ 		complete(&isp_dev->apu_wait_for_ack);
+ 		goto DONE;
+ 	} else if (isp_dev->k_apu_data_flag && cmd == MB_CMD_GET_SUCCESS) {
+-		if (!kfifo_in(&rpu->data_fifo, &rpu->msg, 1)) {
++		mbox_post_msg *msg_copy = kmalloc(sizeof(*rpu->msg), GFP_ATOMIC);
++		if (!msg_copy) {
++			pr_err("Failed to allocate data message copy\n");
++			ret = -ENOMEM;
++			goto ERROR;
++		}
++		memcpy(msg_copy, rpu->msg, sizeof(*rpu->msg));
++		if (!kfifo_in(&rpu->data_fifo, &msg_copy, 1)) {
+ 			pr_err("Failed to queue into apu data kfifo\n");
++			kfree(msg_copy);
+ 			ret = -ENOMEM;
+ 			goto ERROR;
+ 		}
+ 		isp_dev->k_apu_data_flag = 0;
+ 		complete(&isp_dev->apu_wait_for_data);
+ 		goto DONE;
+-	} else if ((rpu->app_wait_flag && cmd == MB_CMD_RES_SUCCESS) ||
+-		   (rpu->app_wait_flag && cmd == MB_CMD_GET_SUCCESS)) {
+-		if (!kfifo_in(&rpu->app_fifo, &rpu->msg, 1)) {
+-			pr_err("Failed to queue into kfifo\n");
++	} else if (cmd == MB_CMD_RES_SUCCESS || cmd == MB_CMD_GET_SUCCESS) {
++		mbox_post_msg *msg_copy = kmalloc(sizeof(*rpu->msg), GFP_ATOMIC);
++		if (!msg_copy) {
++			pr_err("Failed to allocate app message copy\n");
++			ret = -ENOMEM;
++			goto ERROR;
++		}
++		memcpy(msg_copy, rpu->msg, sizeof(*rpu->msg));
++		if (!kfifo_in(&rpu->app_fifo, &msg_copy, 1)) {
++			pr_err("Failed to queue into app kfifo\n");
++			kfree(msg_copy);
+ 			ret = -ENOMEM;
+ 			goto ERROR;
+ 		}
+-		rpu->app_wait_flag = 0;
+-		complete(&rpu->mailbox_completion);
++		mbox_dbg("[MBOX_DEBUG] Enqueue app_fifo: cmd_id=%u, cookie=%u, app_wait=%d, rpu_id=%d\n",
++			cmd, ((payload_packet *)rpu->msg->payload)->cookie,
++			rpu->app_wait_flag, rpu->rpu_id);
++		/*
++		 * User space may send write() first and call read() later.
++		 * Keep responses queued even when no reader is currently waiting.
++		 */
++		if (rpu->app_wait_flag) {
++			rpu->app_wait_flag = 0;
++			complete(&rpu->mailbox_completion);
++		}
+ 		goto DONE;
+ 	} else if (cmd == RPU_2_APU_CMD_DISPLAY_BUFFER) {
+ 		if (isp_dev->frameout_cb) {
+-			if (!kfifo_in(&isp_dev->display_fifo, &rpu->msg, 1)) {
++			mbox_post_msg *msg_copy = kmalloc(sizeof(*rpu->msg), GFP_ATOMIC);
++			if (!msg_copy) {
++				pr_err("Failed to allocate display message copy\n");
++				ret = -ENOMEM;
++				goto ERROR;
++			}
++			memcpy(msg_copy, rpu->msg, sizeof(*rpu->msg));
++			if (!kfifo_in(&isp_dev->display_fifo, &msg_copy, 1)) {
+ 				pr_err("Failed to queue into display kfifo\n");
++				kfree(msg_copy);
+ 				ret = -ENOMEM;
+ 				goto ERROR;
+ 			}
+@@ -234,6 +305,8 @@ int visp_mbox_apu_read(struct rpu_dev *rpu)
+ 	/* Send a message to the RX mailbox channel */
+ ERROR:
+ DONE:
++	if (throttle_response_rearm && visp_rsp_rearm_delay_us)
++		udelay(min_t(unsigned int, visp_rsp_rearm_delay_us, 1000U));
+ 	(void)mbox_send_message(rpu->rx_chan, NULL);
+ 	mutex_unlock(&rpu->read_lock);
+ DISP_DONE:
+diff --git a/visp_mbox/visp_mbox_driver.c b/visp_mbox/visp_mbox_driver.c
+index c641b11..e8f49d5 100644
+--- a/visp_mbox/visp_mbox_driver.c
++++ b/visp_mbox/visp_mbox_driver.c
+@@ -252,8 +252,8 @@ static ssize_t visp_mbox_rpudev_write(struct file *file, const char __user *buf,
+ 	mutex_lock(&rpu->write_lock); // Replaced spinlock with mutex
+ 
+ 	// ADD HERE - Shows what user space is sending
+-    pr_info("[MBOX_DEBUG] User write: cmd_id=%d, dest_core=%d, rpu_id=%d\n",
+-            user_packet->cmd_id, rpu->core_id, rpu->rpu_id);
++    mbox_dbg("[MBOX_DEBUG] User write: cmd_id=%d, cookie=%u, dest_core=%d, rpu_id=%d\n",
++            user_packet->cmd_id, user_packet->cookie, rpu->core_id, rpu->rpu_id);
+ 			
+ 	/* Send command and message */
+ 	ret = visp_mbox_send_command(user_packet->cmd_id, packet,
+@@ -275,6 +275,7 @@ static ssize_t visp_mbox_rpudev_write(struct file *file, const char __user *buf,
+ 		kfree(user_packet);
+ 		return -EIO;
+ 	}
++
+ 	kfree(packet);
+ 	kfree(user_packet);
+ 	return lbuf; // Return the number of bytes written
+@@ -294,33 +295,51 @@ static ssize_t visp_mbox_rpudev_read(struct file *file, char __user *buf,
+ 		return -EINVAL;
+ 	}
+ 
++	mutex_lock(&rpu->ack_lock);
+ 
+-	rpu->app_wait_flag = 1;
+-	/* Acquire lock to protect RPU structure */
+-	/* Wait for completion interruptibly */
+-	result = wait_for_completion_interruptible(&rpu->mailbox_completion);
+-	if (result != 0) {
+-		pr_err("%s: Completion wait interrupted, error code: %d\n",
+-		       __func__, result);
+-		bytes_copied = -ERESTARTSYS; // Return appropriate error for
+-				     // interruption
+-		goto ERROR;
++	/* If response already queued, consume it immediately. */
++	if (kfifo_is_empty(&rpu->app_fifo)) {
++		rpu->app_wait_flag = 1;
++		mutex_unlock(&rpu->ack_lock);
++
++		/* Wait for completion interruptibly */
++		result = wait_for_completion_interruptible(
++			&rpu->mailbox_completion);
++		if (result != 0) {
++			pr_err("%s: Completion wait interrupted, error code: %d\n",
++			       __func__, result);
++			bytes_copied = -ERESTARTSYS;
++			return bytes_copied;
++		}
++
++		mutex_lock(&rpu->ack_lock);
+ 	}
+-	mutex_lock(&rpu->ack_lock);
++	rpu->app_wait_flag = 0;
+ 	mutex_unlock(&rpu->write_lock);
+ 
++	/*
++	 * Deliver responses in strict FIFO order, one per read. Cookie
++	 * matching is performed by user space; the kernel must not filter
++	 * or reorder responses here or the two layers desync.
++	 */
+ 	if (!kfifo_out(&rpu->app_fifo, &msg, 1)) {
+-		pr_err("Failed to queue into kfifo\n");
++		pr_err("Failed to dequeue from app kfifo\n");
+ 		bytes_copied = -ENOMSG;
+ 		goto ERROR;
+ 	}
+ 
+-	rpu->visp_mbox_app_data->cmdid = msg->msg_id;
+-	rpu->visp_mbox_app_data->data = msg->payload;
+ 	size = msg->size;
+ 	memcpy(&rpu->visp_mbox_app_data->res_payload_pkt, msg->payload,
+ 	       ALIGN(size, 8));
+ 
++	mbox_dbg("[MBOX_DEBUG] User read deliver: cmd_id=%d, cookie=%u, rpu_id=%d\n",
++		msg->msg_id,
++		rpu->visp_mbox_app_data->res_payload_pkt.cookie, rpu->rpu_id);
++
++	rpu->visp_mbox_app_data->cmdid = msg->msg_id;
++	rpu->visp_mbox_app_data->data = msg->payload;
++	kfree(msg);
++
+ 	/* Copy data to user space */
+ 	if (copy_to_user(buf, rpu->visp_mbox_app_data, bytes_copied)) {
+ 		pr_err("%s: Failed to copy data to user space\n", __func__);
+@@ -490,6 +509,7 @@ uint8_t xlnx_mbox_apu_wait_for_data(struct visp_dev *isp_dev, void *data)
+ 	       sizeof(rpu->visp_mbox_apu_data->res_payload_pkt.payload));
+ 
+ 	ret = rpu->visp_mbox_apu_data->res_payload_pkt.resp_field.error_subcode_t;
++	kfree(msg);
+ ERROR:
+ 	/* Return the error code from the interrupt's response payload */
+ 	return ret;
+@@ -593,6 +613,7 @@ int xlnx_send_mbox_acked_cmd(struct visp_dev *isp_dev, mb_cmd_id_e cmd,
+ {
+ 	int result;
+ 	struct rpu_dev *rpu;
++	payload_packet *pkt = data;
+ 
+ 	if (!isp_dev || !isp_dev->rpu) {
+ 		pr_err("%s: Invalid ISP device\n", __func__);
+@@ -627,7 +648,8 @@ int xlnx_send_mbox_acked_cmd(struct visp_dev *isp_dev, mb_cmd_id_e cmd,
+ 		return result;
+ 	}
+ 
+-	result = xlnx_mbox_apu_wait_for_ack(isp_dev);
++	result = xlnx_mbox_apu_wait_for_ack_cookie(isp_dev,
++						  pkt ? pkt->cookie : 0);
+ 	if (result < 0) {
+ 		dev_err(rpu->dev, "%s: Failed to get ack\n", __func__);
+ 		goto unlock_and_exit;
+@@ -640,10 +662,20 @@ unlock_and_exit:
+ EXPORT_SYMBOL(xlnx_send_mbox_acked_cmd);
+ 
+ uint8_t xlnx_mbox_apu_wait_for_ack(struct visp_dev *isp_dev)
++{
++	return xlnx_mbox_apu_wait_for_ack_cookie(isp_dev, 0);
++}
++EXPORT_SYMBOL(xlnx_mbox_apu_wait_for_ack);
++
++uint8_t xlnx_mbox_apu_wait_for_ack_cookie(struct visp_dev *isp_dev,
++					  uint32_t expected_cookie)
+ {
+ 	struct rpu_dev *rpu = NULL;
+ 	long result;
++	unsigned long deadline;
++	unsigned long remaining_jiffies;
+ 	mbox_post_msg *msg;
++	payload_packet *ack_payload;
+ 	size_t size;
+ 	int ret;
+ 
+@@ -661,7 +693,7 @@ uint8_t xlnx_mbox_apu_wait_for_ack(struct visp_dev *isp_dev)
+ 	}
+ 
+ 	/* Wait for acknowledgment completion */
+-	long timeout_jiffies = msecs_to_jiffies(VISP_MBOX_ACK_TIMEOUT_MS);
++	deadline = jiffies + msecs_to_jiffies(VISP_MBOX_ACK_TIMEOUT_MS);
+ 	/*
+ 	 * Non-interruptible on purpose -- see xlnx_mbox_apu_wait_for_data().
+ 	 * A SIGINT here would abandon an outstanding APU->RPU command and
+@@ -669,18 +701,29 @@ uint8_t xlnx_mbox_apu_wait_for_ack(struct visp_dev *isp_dev)
+ 	 * subsequent stream-on attempt.  VISP_MBOX_ACK_TIMEOUT_MS bounds the
+ 	 * wait.
+ 	 */
+-	result = wait_for_completion_timeout(
+-	    &isp_dev->apu_wait_for_ack, timeout_jiffies);
++do_wait:
++	remaining_jiffies = deadline - jiffies;
++	if (remaining_jiffies <= 0) {
++		dev_err(rpu->dev,
++			"Timeout while waiting for APU ACK cookie %u\n",
++			expected_cookie);
++		ret = -ETIMEDOUT;
++		goto ERROR;
++	}
++
++	result = wait_for_completion_timeout(&isp_dev->apu_wait_for_ack,
++					     remaining_jiffies);
+ 	if (result == 0) {
+ 		dev_err(rpu->dev,
+-			"Timeout occurred while waiting for APU ACK\n");
++			"Timeout occurred while waiting for APU ACK cookie %u\n",
++			expected_cookie);
+ 		ret = -ETIMEDOUT;
+ 		goto ERROR;
+ 	}
+ 
+ 	if (!kfifo_out(&rpu->ack_fifo, &msg, 1)) {
+-		pr_err("Failed to queue into kfifo\n");
+-		ret = -ENOMSG;
++		/* Completion could have raced; keep waiting within timeout. */
++		goto do_wait;
+ 	}
+ 
+ 	if (!msg) {
+@@ -695,12 +738,24 @@ uint8_t xlnx_mbox_apu_wait_for_ack(struct visp_dev *isp_dev)
+ 	memcpy(&rpu->visp_mbox_intr_data->res_payload_pkt, msg->payload,
+ 	       ALIGN(size, 8));
+ 
+-	return rpu->visp_mbox_intr_data->res_payload_pkt.resp_field.error_subcode_t;
++	ack_payload = &rpu->visp_mbox_intr_data->res_payload_pkt;
++	if (expected_cookie && ack_payload->cookie != expected_cookie) {
++		dev_warn(rpu->dev,
++			 "Dropping stale ACK cookie %u while waiting for %u\n",
++			 ack_payload->cookie, expected_cookie);
++		kfree(msg);
++		reinit_completion(&isp_dev->apu_wait_for_ack);
++		goto do_wait;
++	}
++
++	kfree(msg);
++
++	return ack_payload->resp_field.error_subcode_t;
+ ERROR:
+ 	return ret;
+ 
+ }
+-EXPORT_SYMBOL(xlnx_mbox_apu_wait_for_ack);
++EXPORT_SYMBOL(xlnx_mbox_apu_wait_for_ack_cookie);
+ 
+ static int visp_mbox_mailbox_initialization(struct rpu_dev *rpu)
+ {
+diff --git a/visp_mbox/visp_mbox_driver.h b/visp_mbox/visp_mbox_driver.h
+index a3f8f2c..e44e4b2 100644
+--- a/visp_mbox/visp_mbox_driver.h
++++ b/visp_mbox/visp_mbox_driver.h
+@@ -74,8 +74,22 @@
+ #define MAX_ISP_INSTANCES 6
+ #define VISP_MBOX_MAX_RPU_ID 9
+ 
++/*
++ * Runtime toggle for verbose mailbox cookie tracing. Defaults to off.
++ * Enable at runtime with:
++ *   echo 1 > /sys/module/visp_mbox/parameters/mbox_debug
++ */
++extern unsigned int visp_mbox_debug;
++#define mbox_dbg(fmt, ...)                                                     \
++	do {                                                                  \
++		if (visp_mbox_debug)                                          \
++			pr_info(fmt, ##__VA_ARGS__);                         \
++	} while (0)
++
+ struct rpu_dev *visp_mbox_get_rpu_dev(int rpu_id);
+ uint8_t xlnx_mbox_apu_wait_for_ack(struct visp_dev *isp_dev);
++uint8_t xlnx_mbox_apu_wait_for_ack_cookie(struct visp_dev *isp_dev,
++					     uint32_t expected_cookie);
+ int xlnx_send_mbox_data_cmd(struct visp_dev *isp_dev, mb_cmd_id_e cmd,
+ 			    void *data, uint32_t size, uint8_t dest_cpu,
+ 			    uint8_t src_cpu);
+@@ -106,7 +120,7 @@ struct reserved_memory {
+ 	void __iomem *virt_addr;
+ };
+ 
+-#define RPU_CMD_KFIFO_SIZE 8
++#define RPU_CMD_KFIFO_SIZE 64
+ 
+ /* Structures to hold the rpu_device specific information */
+ struct rpu_dev {

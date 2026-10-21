@@ -1,0 +1,37 @@
+ERICA is built using the AMD Embedded Development Framework - a reference Yocto 
+Project distribution that should be used for testing and development purposes only.
+It is recommended that you create your own distribution for production use.
+
+/AMD/Systems-Engineering/Project-ERICA/
+                                                                ##################
+        ###          #####         ####    ############          #################
+       #####         ######       #####    ####    ######          ###############
+      ### ###        ########   #######    ####       #####                  #####
+     ###   ###       #### #############    ####        ####        #         #####
+    ###     ###      ####   #####  ####    ####        ####      ###         #####
+   ###      ####     ####    ###   ####    ####        ####    #####         #####
+  ###############    ####          ####    ####       #####   ######         #####
+ ####         ####   ####          ####    ####    ######     ############    ####
+####           ####  ####          ####    ############       ##########        ##
+                                                              ########
+              Embedded Robotics for Intelligent, Connected Autonomy
+
+The following common machines:
+    - vek385-base
+    - vek395-base-revb
+    - amd-cortexa78-mali-common
+
+Can build the following images:
+    - erica-xen-image
+    - erica-xen-image-withguest
+    - erica-appdev-image
+    - edf-ospi
+
+Examples:    	
+    MACHINE=vek385-base-revb bitbake edf-ospi
+    MACHINE=amd-cortexa78-mali-common bitbake erica-xen-image
+    MACHINE=amd-cortexa78-mali-common bitbake erica-xen-image-withguest
+    MACHINE=amd-cortexa78-mali-common bitbake erica-appdev-image
+    
+
+

@@ -1,0 +1,194 @@
+From 6556503dd049e54cb7439aab65eedd719450cdaa Mon Sep 17 00:00:00 2001
+From: Tarun Maddipatla <tarun.maddipatlavenkatasaikrishna@amd.com>
+Date: Wed, 18 Mar 2026 10:55:24 +0530
+Subject: [PATCH] net: macb: Add TX pause frame support
+
+Add support for automatic TX pause frame generation using the
+Rx_Watermark register (GEM_RXWMARK). This register enables
+GEM to automatically transmit pause frames when RX SRAM fill level
+crosses configured threshold levels.
+
+Define MACB_CAPS_GEM_HAS_RXWMARK capability flag to limit watermark
+register usage to compatible platforms, as the register existence
+cannot be detected from design configuration registers (DCFG).
+
+Add watermark configuration parameters to macb_config structure:
+ - txpause_quantum: Default pause quantum for the platform.
+ - rx_watermark_high_percent: High threshold percentage.
+ - rx_watermark_low_percent: Low threshold percentage.
+
+If MACB_CAPS_GEM_HAS_RXWMARK capability flag is set,
+call macb_init_rx_watermark() at probe time to calculate
+absolute RX watermark thresholds from RX SRAM depth
+(GEM_DCFG2 RX_PBUF_ADDR field) and configured percentages.
+Store the computed values in macb structure for runtime access.
+
+Configure GEM hardware when TX pause is negotiated:
+ - If MACB_CAPS_GEM_HAS_RXWMARK capability is enabled,
+   program Rx_Watermark register (GEM_RXWMARK) with rx_watermark_low
+   in bits [31:16] and rx_watermark_high in bits [15:0].
+ - Program Tx_Pause_Quantum register (GEM_TXPAUSE) with the
+   configured pause quantum from macb structure.
+
+Clear the Rx_Watermark register (GEM_RXWMARK) and set the
+Tx_Pause_Quantum register to GEM_TXPAUSEQUANTUM_DEFAULT (0xFFFF)
+when TX pause is not negotiated.
+
+Configure Versal platform with:
+ - Pause quantum: 0x7FFF
+ - High watermark: 90% of RX SRAM
+ - Low watermark: 50% of RX SRAM
+
+Signed-off-by: Tarun Maddipatla <tarun.maddipatlavenkatasaikrishna@amd.com>
+Message-ID: <20260318052524.1844626-3-tarun.maddipatlavenkatasaikrishna@amd.com>
+---
+ drivers/net/ethernet/cadence/macb.h      | 18 ++++++++++++
+ drivers/net/ethernet/cadence/macb_main.c | 37 ++++++++++++++++++++++--
+ 2 files changed, 53 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/net/ethernet/cadence/macb.h b/drivers/net/ethernet/cadence/macb.h
+index ba62aa28c08b..1f46269d5477 100644
+--- a/drivers/net/ethernet/cadence/macb.h
++++ b/drivers/net/ethernet/cadence/macb.h
+@@ -83,9 +83,11 @@
+ #define GEM_NCFGR		0x0004 /* Network Config */
+ #define GEM_USRIO		0x000c /* User IO */
+ #define GEM_DMACFG		0x0010 /* DMA Configuration */
++#define GEM_TXPAUSE		0x003C /* Transmit Pause Quantum */
+ #define GEM_PBUFRXCUT		0x0044 /* RX Partial Store and Forward */
+ #define GEM_JML			0x0048 /* Jumbo Max Length */
+ #define GEM_HS_MAC_CONFIG	0x0050 /* GEM high speed config */
++#define GEM_RXWMARK		0x007C /* RXFIFO Watermark Levels for Pause Frames */
+ #define GEM_HRB			0x0080 /* Hash Bottom */
+ #define GEM_HRT			0x0084 /* Hash Top */
+ #define GEM_SA1B		0x0088 /* Specific1 Bottom */
+@@ -489,6 +491,15 @@
+ #define MACB_CLKEN_OFFSET			1
+ #define MACB_CLKEN_SIZE				1
+ 
++/* Bitfields in RXWMARK */
++#define GEM_RXWMARK_HIGH_OFFSET			0
++#define GEM_RXWMARK_HIGH_SIZE			16
++#define GEM_RXWMARK_LOW_OFFSET			16
++#define GEM_RXWMARK_LOW_SIZE			16
++
++/* Default Transmit Pause Quantum value */
++#define GEM_TXPAUSEQUANTUM_DEFAULT		0xFFFF
++
+ /* Bitfields in WOL */
+ #define MACB_IP_OFFSET				0
+ #define MACB_IP_SIZE				16
+@@ -777,6 +788,7 @@
+ #define MACB_CAPS_NEED_TSUCLK			0x00000400
+ #define MACB_CAPS_QUEUE_DISABLE			0x00000800
+ #define MACB_CAPS_QBV				0x00001000
++#define MACB_CAPS_GEM_HAS_RXWMARK		0x00002000
+ #define MACB_CAPS_PCS				0x01000000
+ #define MACB_CAPS_HIGH_SPEED			0x02000000
+ #define MACB_CAPS_CLK_HW_CHG			0x04000000
+@@ -1237,6 +1249,9 @@ struct macb_config {
+ 	unsigned int		max_tx_length;
+ 	int	jumbo_max_len;
+ 	const struct macb_usrio_config *usrio;
++	u16	txpause_quantum;
++	u16	rx_watermark_high_percent;
++	u16	rx_watermark_low_percent;
+ };
+ 
+ struct tsu_incr {
+@@ -1382,6 +1397,9 @@ struct macb {
+ 
+ 	struct macb_pm_data pm_data;
+ 	const struct macb_usrio_config *usrio;
++	u16	rx_watermark_low;
++	u16	rx_watermark_high;
++	u16	pause_quantum;
+ };
+ 
+ #ifdef CONFIG_MACB_USE_HWSTAMP
+diff --git a/drivers/net/ethernet/cadence/macb_main.c b/drivers/net/ethernet/cadence/macb_main.c
+index a6a3868cb5fe..504f65eaaa4f 100644
+--- a/drivers/net/ethernet/cadence/macb_main.c
++++ b/drivers/net/ethernet/cadence/macb_main.c
+@@ -765,9 +765,9 @@ static void macb_mac_link_up(struct phylink_config *config,
+ 	struct net_device *ndev = to_net_dev(config->dev);
+ 	struct macb *bp = netdev_priv(ndev);
+ 	struct macb_queue *queue;
++	u32 ctrl, rx_watermark;
+ 	unsigned long flags;
+ 	unsigned int q;
+-	u32 ctrl;
+ 
+ 	spin_lock_irqsave(&bp->lock, flags);
+ 
+@@ -793,6 +793,19 @@ static void macb_mac_link_up(struct phylink_config *config,
+ 				ctrl |= (GEM_BIT(PAE) | GEM_BIT(DCPF));
+ 			else
+ 				ctrl &= ~(GEM_BIT(PAE) | GEM_BIT(DCPF));
++
++			if (tx_pause) {
++				if (bp->caps & MACB_CAPS_GEM_HAS_RXWMARK) {
++					rx_watermark = GEM_BF(RXWMARK_LOW, bp->rx_watermark_low) |
++						       GEM_BF(RXWMARK_HIGH, bp->rx_watermark_high);
++					gem_writel(bp, RXWMARK, rx_watermark);
++				}
++				gem_writel(bp, TXPAUSE, bp->pause_quantum);
++			} else {
++				if (bp->caps & MACB_CAPS_GEM_HAS_RXWMARK)
++					gem_writel(bp, RXWMARK, 0);
++				gem_writel(bp, TXPAUSE, GEM_TXPAUSEQUANTUM_DEFAULT);
++			}
+ 		} else {
+ 			if (rx_pause)
+ 				ctrl |= MACB_BIT(PAE);
+@@ -5324,6 +5337,17 @@ static int init_reset_optional(struct platform_device *pdev)
+ 	return ret;
+ }
+ 
++static void macb_init_rx_watermark(struct macb *bp, const struct macb_config *macb_config)
++{
++	u16 rx_pbuf_addr_width;
++	u32 total_words;
++
++	rx_pbuf_addr_width = GEM_BFEXT(RX_PBUF_ADDR, gem_readl(bp, DCFG2));
++	total_words = 1U << rx_pbuf_addr_width;
++	bp->rx_watermark_high = (total_words * macb_config->rx_watermark_high_percent) / 100;
++	bp->rx_watermark_low = (total_words * macb_config->rx_watermark_low_percent) / 100;
++}
++
+ static const struct macb_usrio_config sama7g5_usrio = {
+ 	.mii = 0,
+ 	.rmii = 1,
+@@ -5470,12 +5494,15 @@ static const struct macb_config versal_config = {
+ 	.caps = MACB_CAPS_GIGABIT_MODE_AVAILABLE | MACB_CAPS_JUMBO |
+ 		MACB_CAPS_GEM_HAS_PTP | MACB_CAPS_BD_RD_PREFETCH |
+ 		MACB_CAPS_NEED_TSUCLK | MACB_CAPS_QUEUE_DISABLE |
+-		MACB_CAPS_QBV,
++		MACB_CAPS_QBV | MACB_CAPS_GEM_HAS_RXWMARK,
+ 	.dma_burst_length = 16,
+ 	.clk_init = macb_clk_init,
+ 	.init = init_reset_optional,
+ 	.jumbo_max_len = 10240,
+ 	.usrio = &macb_default_usrio,
++	.txpause_quantum = 0x7FFF,
++	.rx_watermark_high_percent = 90,
++	.rx_watermark_low_percent = 50,
+ };
+ 
+ static const struct macb_config versal2_10gbe_config = {
+@@ -5658,6 +5685,12 @@ static int macb_probe(struct platform_device *pdev)
+ 
+ 	/* setup capabilities */
+ 	macb_configure_caps(bp, macb_config);
++	if (bp->caps & MACB_CAPS_GEM_HAS_RXWMARK)
++		macb_init_rx_watermark(bp, macb_config);
++
++	bp->pause_quantum = macb_config->txpause_quantum;
++	if (!bp->pause_quantum)
++		bp->pause_quantum = GEM_TXPAUSEQUANTUM_DEFAULT;
+ 
+ #ifdef CONFIG_ARCH_DMA_ADDR_T_64BIT
+ 	if (GEM_BFEXT(DAW64, gem_readl(bp, DCFG6))) {
+-- 
+2.34.1
+

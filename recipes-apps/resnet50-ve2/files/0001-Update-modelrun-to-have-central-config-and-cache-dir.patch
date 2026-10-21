@@ -1,0 +1,31 @@
+From 9b24335d1090ab3b2686e004e189fdf053a77a28 Mon Sep 17 00:00:00 2001
+From: Kris Chaplin <kris.chaplin@amd.com>
+Date: Mon, 1 Sep 2025 13:34:14 +0000
+Subject: [PATCH] Update modelrun to have central config and cache dir
+
+Signed-off-by: Kris Chaplin <kris.chaplin@amd.com>
+---
+ ve2_ortCppApi_modelrun.cpp | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+ mode change 100755 => 100644 ve2_ortCppApi_modelrun.cpp
+
+diff --git a/ve2_ortCppApi_modelrun.cpp b/ve2_ortCppApi_modelrun.cpp
+old mode 100755
+new mode 100644
+index 4680c4d..3e4766a
+--- a/ve2_ortCppApi_modelrun.cpp
++++ b/ve2_ortCppApi_modelrun.cpp
+@@ -105,8 +105,8 @@ int main(int argc, char* argv[]) {
+ 
+     // Set VitisAI-specific options
+     std::unordered_map<std::string, std::string> options;
+-    options["config_file"] = "./vitisai_config.json";  // Config file
+-    options["cacheDir"] = "./my_cache_dir";  // Cache dir used to compile the model, should match compilation result.
++    options["config_file"] = "/usr/share/resnet50-ve2/vitisai_config.json";  // Config file
++    options["cacheDir"] = "/usr/share/resnet50-ve2/my_cache_dir";  // Cache dir used to compile the model, should match compilation result.
+     options["cacheKey"] = "resnet50_quantized_xint8"; // Cache key used to compile the model, should match compilation result.
+ 
+     // ORT Session with VitisAIExecutionProvider
+-- 
+2.25.1
+

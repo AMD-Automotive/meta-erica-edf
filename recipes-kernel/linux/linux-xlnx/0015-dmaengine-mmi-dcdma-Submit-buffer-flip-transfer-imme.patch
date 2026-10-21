@@ -1,0 +1,82 @@
+From 01d4816b0fe90d3e77ea994b2a2bd4e3d9d61e7b Mon Sep 17 00:00:00 2001
+From: Anatoliy Klymenko <anatoliy.klymenko@amd.com>
+Date: Mon, 8 Dec 2025 15:22:18 -0800
+Subject: [PATCH 15/15] dmaengine: mmi-dcdma: Submit buffer flip transfer
+ immediately
+
+Waiting for a vblank interrupt to swap DMA transfer is not necessary. Such
+a wait results in screen tearing and jerky video playback. This change
+fixes the issue by scheduling swapping DMA transfer immediately.
+
+Signed-off-by: Anatoliy Klymenko <anatoliy.klymenko@amd.com>
+---
+ drivers/dma/xilinx/mmi_dcdma.c | 33 +++------------------------------
+ 1 file changed, 3 insertions(+), 30 deletions(-)
+
+diff --git a/drivers/dma/xilinx/mmi_dcdma.c b/drivers/dma/xilinx/mmi_dcdma.c
+index 299b33e3bdf1..1739d459de40 100644
+--- a/drivers/dma/xilinx/mmi_dcdma.c
++++ b/drivers/dma/xilinx/mmi_dcdma.c
+@@ -616,30 +616,6 @@ static void mmi_dcdma_chan_handle_no_ostand(struct mmi_dcdma_chan *chan)
+ 	wake_up(wait_to_stop);
+ }
+ 
+-/**
+- * mmi_dcdma_chan_handle_vsync - Handle VSYNC interrupt
+- * @chan: DCDMA channel
+- *
+- * Handle vertical sync interrupt. Here we should check if we have a pending
+- * DMA request and start it.
+- */
+-static void mmi_dcdma_chan_handle_vsync(struct mmi_dcdma_chan *chan)
+-{
+-	struct virt_dma_desc *pending;
+-	unsigned long flags;
+-
+-	spin_lock_irqsave(&chan->vchan.lock, flags);
+-	pending = vchan_next_desc(&chan->vchan);
+-	if (pending) {
+-		if (chan->active_desc) {
+-			vchan_cookie_complete(&chan->active_desc->vdesc);
+-			chan->active_desc = NULL;
+-		}
+-		mmi_dcdma_chan_start_transfer(chan);
+-	}
+-	spin_unlock_irqrestore(&chan->vchan.lock, flags);
+-}
+-
+ /* DCDMA Channels */
+ 
+ /**
+@@ -828,15 +804,15 @@ static void mmi_dcdma_chan_start_transfer(struct mmi_dcdma_chan *chan)
+ 
+ 	lockdep_assert_held(&chan->vchan.lock);
+ 
+-	if (chan->active_desc)
+-		return;
+-
+ 	vdesc = vchan_next_desc(&chan->vchan);
+ 	if (!vdesc)
+ 		return;
+ 
+ 	list_del(&vdesc->node);
+ 
++	if (chan->active_desc)
++		vchan_cookie_complete(&chan->active_desc->vdesc);	
++
+ 	if (!mmi_dcdma_chan_enabled(chan)) {
+ 		mmi_dcdma_chan_enable(chan);
+ 		first_frame = true;
+@@ -1308,9 +1284,6 @@ static irqreturn_t mmi_dcdma_irq_handler(int irq, void *data)
+ 		if (status & MMI_DCDMA_NO_OSTAND_TRAN(ch))
+ 			mmi_dcdma_chan_handle_no_ostand(chan);
+ 
+-		if (misc_status & MMI_DCDMA_IRQ_VSYNC &&
+-		    mmi_dcdma_chan_enabled(chan))
+-			mmi_dcdma_chan_handle_vsync(chan);
+ 	}
+ 
+ 	return IRQ_HANDLED;
+-- 
+2.44.4
+

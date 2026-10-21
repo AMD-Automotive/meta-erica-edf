@@ -1,0 +1,7 @@
+SPDX-FileCopyrightText: Copyright © Advanced Micro Devices, Inc., or its affiliates. All rights reserved.
+SPDX-FileContributor: KJ
+# Maintainer: LT
+# Provenance: AMD-authored modification to AMD embeddedsw xilloader and xilpm_ng
+# Owning source license: MIT
+
+SPDX-License-Identifier: MIT

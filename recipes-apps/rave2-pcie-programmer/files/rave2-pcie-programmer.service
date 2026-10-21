@@ -1,0 +1,17 @@
+# Copyright © Advanced Micro Devices, Inc., or its affiliates. All rights reserved.
+# SPDX-License-Identifier: MIT
+# Contributors: KC
+# Maintainer: KC
+
+[Unit]
+Description=RAVE2 PCIe OSPI/SDA Programming Service
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/programmer
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

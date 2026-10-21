@@ -1,0 +1,12 @@
+#!/bin/sh
+# Copyright © Advanced Micro Devices, Inc., or its affiliates. All rights reserved.
+# SPDX-License-Identifier: MIT
+# Contributors: LT
+# Maintainer: LT
+
+echo "Configuring Cameras"
+echo "==================="
+
+video_config --xml_path /usr/share/plf-rave2/e+_0123.xml
+video_config --xml_path /usr/share/plf-rave2/e+_4567.xml
+

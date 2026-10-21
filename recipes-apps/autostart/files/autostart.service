@@ -1,0 +1,13 @@
+# Copyright © Advanced Micro Devices, Inc., or its affiliates. All rights reserved.
+# SPDX-License-Identifier: MIT
+# Contributors: KC
+# Maintainer: KC
+
+[Unit]
+Description=Boot script for misc init tasks
+
+[Service]
+ExecStart=/usr/bin/autostart.sh
+
+[Install]
+WantedBy=multi-user.target

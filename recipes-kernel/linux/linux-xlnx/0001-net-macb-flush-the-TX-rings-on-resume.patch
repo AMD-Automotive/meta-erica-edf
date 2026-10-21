@@ -1,0 +1,130 @@
+From ec9823cd8bcca2bc006b9a7c0fa9862302b29d7c Mon Sep 17 00:00:00 2001
+From: Jon Cory <jcory@amd.com>
+Date: Wed, 30 Sep 2026 12:38:15 -0400
+Subject: [PATCH] net: macb: flush the TX rings on resume
+
+Suspend stops the MAC with NAPI already disabled, so a TX ring can be left
+holding frames the hardware completed (TX_USED set) but that were never
+reaped, followed by frames that were never sent.  Resume points TBQP back
+at descriptor 0 and link-up rotates the ring so the software tail lands
+there too, which leaves a completed descriptor under the hardware pointer.
+
+The next TSTART reads that descriptor and raises TXUBR.  macb_tx_restart()
+then issues TSTART again because tx_head != tx_tail, and the hardware never
+gets past the used descriptor to the pending frames.  The queue's in-flight
+bytes never complete, so BQL keeps it stopped and every flow hashed to it is
+dropped before reaching the wire, while TXUBR re-fires at ~200k interrupts/s.
+Other queues keep working, and only 'ip link set down/up' recovered, since
+macb_close() is the only path that resets the rings and BQL.
+
+Return every TX queue to its post-open state on resume instead: reclaim
+anything still on the ring, mark all descriptors free, zero head and tail
+and reset BQL, before TBQP is reprogrammed.  Frames the hardware had already
+sent are counted as transmitted; frames never sent are dropped and counted
+in tx_dropped.
+---
+ drivers/net/ethernet/cadence/macb_main.c | 80 +++++++++++++++++++++++-
+ 1 file changed, 79 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/net/ethernet/cadence/macb_main.c b/drivers/net/ethernet/cadence/macb_main.c
+index 27a8168..f77f656 100644
+--- a/drivers/net/ethernet/cadence/macb_main.c
++++ b/drivers/net/ethernet/cadence/macb_main.c
+@@ -6219,6 +6219,82 @@ static int __maybe_unused macb_suspend(struct device *dev)
+ 	return 0;
+ }
+ 
++/* Drop whatever the TX rings still hold and return every queue to its
++ * post-open state: all descriptors free, tx_head == tx_tail == 0, and the
++ * byte queue limits reset.
++ *
++ * Suspend stops the MAC with NAPI already disabled, so a ring can be left
++ * holding frames the hardware completed (TX_USED set) but that were never
++ * reaped, followed by frames that were never sent. Resume points TBQP back
++ * at descriptor 0 and link-up rotates each ring so the software tail lands
++ * there too, which leaves a completed descriptor under the hardware pointer.
++ * The next TSTART reads it and raises TXUBR; macb_tx_restart() then issues
++ * TSTART again because tx_head != tx_tail, and the hardware never gets past
++ * that descriptor to the pending frames. The result is an endless TXUBR
++ * interrupt storm and a TX queue whose in-flight bytes never complete, so
++ * BQL keeps it stopped and every flow hashed to it is lost.
++ *
++ * Must be called with NAPI disabled, the device detached and TE clear.
++ */
++static void macb_tx_flush_rings(struct macb *bp)
++{
++	struct macb_dma_desc *desc = NULL;
++	struct macb_tx_skb *tx_skb;
++	struct macb_queue *queue;
++	bool first, sent = false;
++	unsigned long flags;
++	unsigned int q, i;
++
++	/* Make hw descriptor updates visible to CPU */
++	rmb();
++
++	for (q = 0, queue = bp->queues; q < bp->num_queues; ++q, ++queue) {
++		spin_lock_irqsave(&queue->tx_ptr_lock, flags);
++
++		/* TX_USED is written back on the first buffer of a frame and the
++		 * skb hangs off the last one: a frame the hardware completed but
++		 * that was never reaped counts as sent, anything else as dropped.
++		 */
++		first = true;
++		for (i = queue->tx_tail; i != queue->tx_head; i++) {
++			tx_skb = macb_tx_skb(queue, i);
++			if (first) {
++				sent = macb_tx_desc(queue, i)->ctrl & MACB_BIT(TX_USED);
++				first = false;
++			}
++			if (tx_skb->skb) {
++				if (sent) {
++					bp->dev->stats.tx_packets++;
++					queue->stats.tx_packets++;
++					bp->dev->stats.tx_bytes += tx_skb->skb->len;
++					queue->stats.tx_bytes += tx_skb->skb->len;
++				} else {
++					bp->dev->stats.tx_dropped++;
++					queue->stats.tx_dropped++;
++				}
++				first = true;
++			}
++			macb_tx_unmap(bp, tx_skb, 0);
++		}
++
++		for (i = 0; i < bp->tx_ring_size; i++) {
++			desc = macb_tx_desc(queue, i);
++			macb_set_addr(bp, desc, 0);
++			desc->ctrl = MACB_BIT(TX_USED);
++		}
++		desc->ctrl |= MACB_BIT(TX_WRAP);
++		queue->tx_head = 0;
++		queue->tx_tail = 0;
++
++		spin_unlock_irqrestore(&queue->tx_ptr_lock, flags);
++
++		netdev_tx_reset_queue(netdev_get_tx_queue(bp->dev, q));
++	}
++
++	/* Make descriptor updates visible to hardware */
++	wmb();
++}
++
+ static int __maybe_unused macb_resume(struct device *dev)
+ {
+ 	struct net_device *netdev = dev_get_drvdata(dev);
+@@ -6274,8 +6350,10 @@ static int __maybe_unused macb_resume(struct device *dev)
+ 		rtnl_unlock();
+ 	}
+ 
+-	if (!(bp->caps & MACB_CAPS_MACB_IS_EMAC))
++	if (!(bp->caps & MACB_CAPS_MACB_IS_EMAC)) {
++		macb_tx_flush_rings(bp);
+ 		macb_init_buffers(bp);
++	}
+ 
+ 	for (q = 0, queue = bp->queues; q < bp->num_queues;
+ 	     ++q, ++queue) {
+-- 
+2.43.0
+

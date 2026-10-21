@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+Copyright © Advanced Micro Devices, Inc., or its affiliates. All rights reserved.
+SPDX-License-Identifier: MIT
+Contributors: KC
+Maintainer: KC
+
+Camera pipeline composition for the AMD video_config tool. The Xylon register
+tables it references carry their own BSD-3-Clause notice.
+-->
+<Config>
+
+    <Board name="FMC_GMSL2" type="BoardFmcGmsl2" i2cdev="/dev/i2c-0">
+
+        <Configuration type="inifile" conf="logiFMC_GMSL.ini"></Configuration >
+    
+        <Device name="Deser1" type="Deser_MAX9296" i2caddr="0xD0">
+            <Configuration type="inifile" conf="Xylon_gmsl_deser_9296A_sim.ini">
+                <Variables>
+                    <DESERIALIZER>0xD0</DESERIALIZER>
+                    <EXP_SEL_DESER>0xA</EXP_SEL_DESER>
+                    <VERBOSE>0</VERBOSE>
+                </Variables>
+            </Configuration >
+        </Device>
+            
+        <Device name="Deser2" type="Deser_MAX9296"  i2caddr="0x94">
+            <Configuration type="inifile" conf="Xylon_gmsl_deser_9296A_sim.ini">
+                <Variables>
+                    <DESERIALIZER>0x94</DESERIALIZER>
+                    <EXP_SEL_DESER>0xA</EXP_SEL_DESER>
+                    <VERBOSE>0</VERBOSE>                    
+                </Variables>
+            </Configuration >          
+        </Device>  
+              
+    </Board>
+ 
+</Config>

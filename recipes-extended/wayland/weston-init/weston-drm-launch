@@ -1,0 +1,24 @@
+#!/bin/sh
+# Copyright © Advanced Micro Devices, Inc., or its affiliates. All rights reserved.
+# SPDX-License-Identifier: MIT
+# Contributors: LT
+# Maintainer: LT
+# Launch weston on the KMS display device.  The DRM card index is not stable:
+# on some boards the mmi-dc display is card0, on others the non-KMS xlnx-mixer
+# cards enumerate first and the display lands on card2.  Pick the card that
+# actually exposes connectors (a KMS device) instead of hardcoding cardN.
+dev=
+for card in /sys/class/drm/card[0-9]*; do
+	name=${card##*/}
+	case "$name" in
+		*-*) continue ;;   # skip connector nodes like card2-DP-1
+	esac
+	for conn in "$card"-*; do
+		[ -e "$conn" ] || continue
+		dev=$name
+		break
+	done
+	[ -n "$dev" ] && break
+done
+
+exec /usr/bin/weston --modules=systemd-notify.so ${dev:+--drm-device=$dev} "$@"

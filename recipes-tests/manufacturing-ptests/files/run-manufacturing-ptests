@@ -1,0 +1,321 @@
+#!/bin/sh
+# Copyright © Advanced Micro Devices, Inc., or its affiliates. All rights reserved.
+# SPDX-License-Identifier: MIT
+# Contributors: KC
+# Maintainer: KC
+
+# --- Configuration ---
+# Tests deferred to Phase 2 (long-running stress tests)
+SECONDARY_TESTS="cpu-test memory-test"
+
+# Default network/test parameters
+IPERF_SERVER="192.168.1.10"
+IPERF_MIN_BW="800"
+IPERF10_SERVER="192.168.1.10"
+IPERF10_MIN_BW="9000"
+if [ -d /sys/class/net/end0 ]; then
+    IPERF_IFACE="end0"
+else
+    IPERF_IFACE="eth0"
+fi
+IPERF10_IFACE="eth1"
+USE_DHCP=false
+RUN_PRIMARY=true
+RUN_STRESS=true
+
+usage() {
+    cat <<'EOF'
+Usage: run-manufacturing-ptests [options]
+
+Options:
+    -dhcp                         Keep Ethernet boot configuration (DHCP)
+  -noprimary                    Skip Phase 1 (primary tests)
+  -nostress                     Skip Phase 2 (stress tests)
+  -iperf_server <ip>            Override IPERF_SERVER (default: 192.168.1.10)
+  -iperf_min_bw <mbps>          Override IPERF_MIN_BW (default: 800)
+  -iperf10_server <ip>          Override IPERF10_SERVER (default: 192.168.1.10)
+  -iperf10_min_bw <mbps>        Override IPERF10_MIN_BW (default: 9000)
+  -h, --help                    Show this help text
+EOF
+}
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -dhcp)
+            USE_DHCP=true
+            shift
+            ;;
+        -noprimary)
+            RUN_PRIMARY=false
+            shift
+            ;;
+        -nostress)
+            RUN_STRESS=false
+            shift
+            ;;
+        -iperf_server)
+            [ -n "$2" ] || { echo "Missing value for $1"; usage; exit 2; }
+            IPERF_SERVER="$2"
+            shift 2
+            ;;
+        -iperf_min_bw)
+            [ -n "$2" ] || { echo "Missing value for $1"; usage; exit 2; }
+            IPERF_MIN_BW="$2"
+            shift 2
+            ;;
+        -iperf10_server)
+            [ -n "$2" ] || { echo "Missing value for $1"; usage; exit 2; }
+            IPERF10_SERVER="$2"
+            shift 2
+            ;;
+        -iperf10_min_bw)
+            [ -n "$2" ] || { echo "Missing value for $1"; usage; exit 2; }
+            IPERF10_MIN_BW="$2"
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1"
+            usage
+            exit 2
+            ;;
+    esac
+done
+
+ENV_VARS="PYTHONUNBUFFERED=1 IPERF_SERVER=$IPERF_SERVER IPERF_IFACE=$IPERF_IFACE IPERF10_SERVER=$IPERF10_SERVER IPERF10_IFACE=$IPERF10_IFACE IPERF_MIN_BW=$IPERF_MIN_BW IPERF10_MIN_BW=$IPERF10_MIN_BW"
+
+# --- Consolidated results file (name outcome log) ---
+RESULTS_FILE=$(mktemp /tmp/ptest-results-XXXXXX)
+
+# --- Parse ptest-runner output and append results ---
+# Usage: parse_results <logfile>
+parse_results() {
+    _logfile="$1"
+    _cur_test=""
+    _cur_outcome=""
+    _cur_log=""
+
+    while IFS= read -r _line; do
+        case "$_line" in
+            "BEGIN: /usr/lib/"*)
+                if [ -n "$_cur_test" ]; then
+                    _resolve_log
+                    echo "$_cur_test ${_cur_outcome:-UNKNOWN} $_cur_log" >> "$RESULTS_FILE"
+                fi
+                _cur_test=$(echo "$_line" | sed 's|BEGIN: /usr/lib/||; s|/ptest||')
+                _cur_outcome=""
+                _cur_log=""
+                ;;
+            *"outcome: PASS"*)
+                _cur_outcome="PASS"
+                ;;
+            *"outcome: FAIL"*|*"outcome: TIMEOUT"*|*"outcome: ERROR"*)
+                _cur_outcome="FAIL"
+                ;;
+            "Log  : "*)
+                _cur_log=$(echo "$_line" | sed 's/^Log  : //')
+                ;;
+            *"Log file: "*)
+                _cur_log=$(echo "$_line" | sed 's/.*Log file: //')
+                ;;
+        esac
+    done < "$_logfile"
+    # Flush last entry
+    if [ -n "$_cur_test" ]; then
+        _resolve_log
+        echo "$_cur_test ${_cur_outcome:-UNKNOWN} $_cur_log" >> "$RESULTS_FILE"
+    fi
+}
+
+_resolve_log() {
+    if [ -z "$_cur_log" ]; then
+        _pattern=$(echo "$_cur_test" | sed 's/-/_/g')
+        _match=$(ls -t /tmp/output/${_pattern}_* 2>/dev/null | head -1)
+        if [ -n "$_match" ]; then
+            _cur_log="$_match"
+        else
+            _cur_log="-"
+        fi
+    fi
+}
+
+# --- Print a section summary from results file ---
+# Usage: print_section_summary <title> <test1 test2 ...>
+print_section_summary() {
+    _title="$1"
+    shift
+    _tests="$*"
+
+    echo ""
+    echo "============= ${_title} ============="
+    printf "%-24s  %-10s %s\n" "TEST" "RESULT" "LOG"
+    echo "----------------------------------------------------"
+
+    _sp=0
+    _sf=0
+
+    for _t in $_tests; do
+        _entry=$(grep "^${_t} " "$RESULTS_FILE" 2>/dev/null)
+        if [ -n "$_entry" ]; then
+            _res=$(echo "$_entry" | awk '{print $2}')
+            _log=$(echo "$_entry" | awk '{$1=$2=""; sub(/^  */,""); print}')
+            if [ "$_res" = "PASS" ]; then
+                printf "%-24s  %-10s %s\n" "$_t" "$_res" "$_log"
+                _sp=$((_sp + 1))
+            else
+                printf "%-24s  %-10s %s\n" "$_t" "**$_res**" "$_log"
+                _sf=$((_sf + 1))
+            fi
+        fi
+    done
+
+    echo "----------------------------------------------------"
+    _st=$((_sp + _sf))
+    if [ "$_sf" -gt 0 ]; then
+        printf "TOTAL: %d   PASS: %d   *** FAIL: %d ***\n" "$_st" "$_sp" "$_sf"
+    else
+        printf "TOTAL: %d   PASS: %d   FAIL: %d\n" "$_st" "$_sp" "$_sf"
+    fi
+    echo "====================================================="
+}
+
+# --- Report interface and iperf settings before primary tests ---
+get_ipv4_addr() {
+    _iface="$1"
+    _ip=$(ip -4 addr show dev "$_iface" 2>/dev/null | awk '/inet /{print $2; exit}')
+    if [ -n "$_ip" ]; then
+        echo "$_ip"
+    else
+        echo "not configured"
+    fi
+}
+
+# ===================================================================
+# Main
+# ===================================================================
+
+echo "================================================="
+echo " Manufacturing ptests starting: $(date -Iseconds)"
+echo "================================================="
+
+if ! $USE_DHCP; then
+    ifconfig "$IPERF_IFACE" 192.168.1.100 netmask 255.255.255.0 up
+    ifconfig "$IPERF10_IFACE" 192.168.1.101 netmask 255.255.255.0 up
+fi
+
+# Discover all available tests
+ALL_TESTS=$(ptest-runner -l 2>/dev/null | grep '/' | awk '{print $1}')
+
+# Split into primary and secondary
+PRIMARY_RUN=""
+SECONDARY_RUN=""
+for t in $ALL_TESTS; do
+    _is_secondary=false
+    for s in $SECONDARY_TESTS; do
+        if [ "$t" = "$s" ]; then
+            _is_secondary=true
+            break
+        fi
+    done
+    if $_is_secondary; then
+        SECONDARY_RUN="${SECONDARY_RUN:+$SECONDARY_RUN }$t"
+    else
+        PRIMARY_RUN="${PRIMARY_RUN:+$PRIMARY_RUN }$t"
+    fi
+done
+
+overall_rc=0
+
+# --- Phase 1: Primary tests ---
+if $RUN_PRIMARY; then
+    echo ""
+    echo "========== PHASE 1: Primary tests =========="
+    echo ""
+
+    echo "Primary test network/settings:"
+    echo "  $IPERF_IFACE IP          : $(get_ipv4_addr "$IPERF_IFACE")"
+    echo "  $IPERF10_IFACE IP          : $(get_ipv4_addr "$IPERF10_IFACE")"
+    echo "  IPERF_SERVER     : $IPERF_SERVER"
+    echo "  IPERF_MIN_BW     : $IPERF_MIN_BW"
+    echo "  IPERF10_SERVER   : $IPERF10_SERVER"
+    echo "  IPERF10_MIN_BW   : $IPERF10_MIN_BW"
+    echo ""
+
+    PTEST_LOG1=$(mktemp /tmp/ptest-p1-XXXXXX)
+    eval "$ENV_VARS stdbuf -oL ptest-runner $PRIMARY_RUN 2>&1" | tee "$PTEST_LOG1"
+    rc1=${PIPESTATUS[0]:-$?}
+    [ "$rc1" -ne 0 ] && overall_rc=1
+
+    parse_results "$PTEST_LOG1"
+    print_section_summary "PHASE 1: Primary Tests" $PRIMARY_RUN
+    rm -f "$PTEST_LOG1"
+else
+    echo ""
+    echo "========== PHASE 1: Primary tests =========="
+    echo "Skipped (-noprimary)"
+fi
+
+# --- Phase 2: Stress tests ---
+if [ -n "$SECONDARY_RUN" ] && $RUN_STRESS; then
+    echo ""
+    echo "========== PHASE 2: Stress tests =========="
+    echo ""
+
+    PTEST_LOG2=$(mktemp /tmp/ptest-p2-XXXXXX)
+    eval "$ENV_VARS stdbuf -oL ptest-runner $SECONDARY_RUN 2>&1" | tee "$PTEST_LOG2"
+    rc2=${PIPESTATUS[0]:-$?}
+    [ "$rc2" -ne 0 ] && overall_rc=1
+
+    parse_results "$PTEST_LOG2"
+    print_section_summary "PHASE 2: Stress Tests" $SECONDARY_RUN
+    rm -f "$PTEST_LOG2"
+elif ! $RUN_STRESS; then
+    echo ""
+    echo "========== PHASE 2: Stress tests =========="
+    echo "Skipped (-nostress)"
+fi
+
+# --- Consolidated summary ---
+echo ""
+echo "============ CONSOLIDATED SUMMARY ============"
+printf "%-24s  %-10s %s\n" "TEST" "RESULT" "LOG"
+echo "----------------------------------------------------"
+
+total_pass=0
+total_fail=0
+
+for t in $ALL_TESTS; do
+    _entry=$(grep "^${t} " "$RESULTS_FILE" 2>/dev/null)
+    if [ -n "$_entry" ]; then
+        _res=$(echo "$_entry" | awk '{print $2}')
+        _log=$(echo "$_entry" | awk '{$1=$2=""; sub(/^  */,""); print}')
+        if [ "$_res" = "PASS" ]; then
+            printf "%-24s  %-10s %s\n" "$t" "$_res" "$_log"
+            total_pass=$((total_pass + 1))
+        else
+            printf "%-24s  %-10s %s\n" "$t" "**$_res**" "$_log"
+            total_fail=$((total_fail + 1))
+        fi
+    fi
+done
+
+total=$((total_pass + total_fail))
+echo "----------------------------------------------------"
+if [ "$total_fail" -gt 0 ]; then
+    printf "TOTAL: %d   PASS: %d   *** FAIL: %d ***\n" "$total" "$total_pass" "$total_fail"
+else
+    printf "TOTAL: %d   PASS: %d   FAIL: %d\n" "$total" "$total_pass" "$total_fail"
+fi
+echo "====================================================="
+
+echo ""
+echo "================================================="
+echo " Manufacturing ptests finished: $(date -Iseconds)"
+echo " exit=$overall_rc  (0=all pass, nonzero=some failed)"
+echo "================================================="
+
+rm -f "$RESULTS_FILE"
+exit "$overall_rc"

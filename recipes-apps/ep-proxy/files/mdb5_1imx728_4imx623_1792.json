@@ -1,0 +1,35 @@
+{
+    "low_latency": true,
+    "channels": [
+        {
+            "v4l2_dev": "/dev/video0",
+            "width": 1792,
+            "height": 1536,
+            "format": "NV12"
+        },
+        {
+            "v4l2_dev": "/dev/video2",
+            "width": 1792,
+            "height": 1536,
+            "format": "NV12"
+        },
+        {
+            "v4l2_dev": "/dev/video4",
+            "width": 1792,
+            "height": 1536,
+            "format": "NV12"
+        },
+        {
+            "v4l2_dev": "/dev/video6",
+            "width": 1792,
+            "height": 1536,
+            "format": "NV12"
+        },
+        {
+            "v4l2_dev": "/dev/video10",
+            "width": 3840,
+            "height": 2160,
+            "format": "NV12"
+        }
+    ]
+}

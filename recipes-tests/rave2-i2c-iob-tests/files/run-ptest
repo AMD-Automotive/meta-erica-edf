@@ -1,0 +1,15 @@
+#!/bin/sh
+# Copyright © Advanced Micro Devices, Inc., or its affiliates. All rights reserved.
+# SPDX-License-Identifier: MIT
+# Contributors: KC
+# Maintainer: KC
+set -eu
+
+python3 ./rave2_i2c_iob_tests.py
+rc=$?
+
+if [ "$rc" = "77" ]; then
+    exit 77
+fi
+
+exit $rc

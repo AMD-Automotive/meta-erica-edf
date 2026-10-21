@@ -1,0 +1,268 @@
+From e3aedd11ff18d56a77ab0a3ad7db2c2e77d14783 Mon Sep 17 00:00:00 2001
+From: LT Thomas <lthomas@amd.com>
+Date: Tue, 21 Apr 2026 15:07:08 -0700
+Subject: [PATCH] LT: Updating driver to ignore stream-off and keep ISP enabled
+ always
+
+---
+ visp/visp_driver.c           | 125 ++++++++++++++++++++++++++++++-----
+ visp/visp_driver.h           |  11 +++
+ visp_mbox/visp_mbox_driver.c |  32 ++++++---
+ 3 files changed, 142 insertions(+), 26 deletions(-)
+
+diff --git a/visp/visp_driver.c b/visp/visp_driver.c
+index 4e9b1fe..80ba56b 100644
+--- a/visp/visp_driver.c
++++ b/visp/visp_driver.c
+@@ -1174,13 +1174,17 @@ static int visp_pad_s_stream(struct v4l2_subdev *sd, void *arg)
+ 	 * is done and allows the ISP/ input subdev streamon
+ 	 */
+ 	if (pad_stream->status == 1 && isp_dev->isp_ports[port].camera_connect_ref_cnt) {
++		bool first_streamon_for_port;
++
+ 		/* ENTER PORT Level CRITICAL SECTION */
+ 		mutex_lock(&isp_dev->rpu->rpu_lock);
+ 		/*
+ 		 * the subdev_streamon_count[port] holds the count of number of
+ 		 * piplines MP/SP/RAW are up on a port
+ 		 */
+-		if (ISP_DEV_EXTENDED(isp_dev)->subdev_streamon_count[port] == 0) {
++		first_streamon_for_port =
++		    (ISP_DEV_EXTENDED(isp_dev)->subdev_streamon_count[port] == 0);
++		if (first_streamon_for_port) {
+ 			ISP_DEV_EXTENDED(isp_dev)->subdev_streamon_count[port]++;
+ 		/* Stream on all pipeline subdevices */
+ 			ret = visp_stream_pipeline_subdevs(isp_dev, port, 1);
+@@ -1194,24 +1198,56 @@ static int visp_pad_s_stream(struct v4l2_subdev *sd, void *arg)
+ 			ISP_DEV_EXTENDED(isp_dev)->subdev_streamon_count[port]++;
+ 		}
+ 
++		/*
++		 * Keep-alive pin: take an extra reference on the per-port
++		 * pipeline stream count the first time this port goes live.
++		 * This prevents the upstream sensor pipeline + RPU camera
++		 * connection from being torn down when the last client
++		 * disconnects, so the next client to attach picks up the
++		 * stream still running at the previously programmed framerate.
++		 * The pin is released only by visp_remove() at module unload.
++		 */
++		if (!ISP_DEV_EXTENDED(isp_dev)->keep_alive_ref_held[port]) {
++			ISP_DEV_EXTENDED(isp_dev)->subdev_streamon_count[port]++;
++			ISP_DEV_EXTENDED(isp_dev)->keep_alive_ref_held[port] = true;
++			dev_info(isp_dev->dev,
++				 "Keep-alive pin acquired for port %d (RPU/sensor will stay live across client disconnects)\n",
++				 port);
++		}
++
+ 		/* EXIT PORT Level CRITICAL SECTION */
+ 
+-		ret = media_isp_device_set_frame_rate(isp_dev, port,
+-				&isp_dev->isp_ports[port].sensor_info.frame_rate);
+-		if (ret != VSI_SUCCESS) {
+-			dev_err(isp_dev->dev,
+-				"%s isp:%d port %d chn %d Set frame_rate failed, ret is %d",
+-				__func__, isp_dev->id, port, chn, ret);
+-			ret = -EINVAL;
+-			goto ERR_TO_RPU_LOCK;
+-		}
++		/*
++		 * On a keep-alive replay (port pipeline was still up because
++		 * the keep-alive pin was holding it open), the sensor frame
++		 * rate and per-channel format are already programmed in the
++		 * RPU.  Re-issuing them here is unnecessary and, worse, will
++		 * fail if the RPU rejects a duplicate set_frame_rate while
++		 * the sensor is already streaming.  Only program them on the
++		 * very first stream-on for this port.
++		 */
++		if (first_streamon_for_port) {
++			ret = media_isp_device_set_frame_rate(isp_dev, port,
++					&isp_dev->isp_ports[port].sensor_info.frame_rate);
++			if (ret != VSI_SUCCESS) {
++				dev_err(isp_dev->dev,
++					"%s isp:%d port %d chn %d Set frame_rate failed, ret is %d",
++					__func__, isp_dev->id, port, chn, ret);
++				ret = -EINVAL;
++				goto ERR_TO_RPU_LOCK;
++			}
+ 
+-		ret = media_isp_device_set_format(isp_dev, port, chn);
+-		if (ret != 0) {
+-			dev_err(isp_dev->dev, "%s isp_id : %d FAILED SetFormat\n",
+-				__func__, isp_dev->id);
+-			ret = -EINVAL;
+-			goto ERR_TO_RPU_LOCK;
++			ret = media_isp_device_set_format(isp_dev, port, chn);
++			if (ret != 0) {
++				dev_err(isp_dev->dev, "%s isp_id : %d FAILED SetFormat\n",
++					__func__, isp_dev->id);
++				ret = -EINVAL;
++				goto ERR_TO_RPU_LOCK;
++			}
++		} else {
++			dev_dbg(isp_dev->dev,
++				"Keep-alive replay on isp:%d port %d chn %d -- skipping set_frame_rate/set_format\n",
++				isp_dev->id, port, chn);
+ 		}
+ 
+ 		ret = media_isp_device_stream_on(isp_dev, port, chn);
+@@ -2726,12 +2762,69 @@ err_async_notifier:
+ 	return ret;
+ }
+ 
++static void visp_release_keep_alive_pins(struct visp_dev *isp_dev)
++{
++	int port;
++
++	if (!isp_dev || !isp_dev->extended_struct)
++		return;
++
++	/*
++	 * Release the per-port keep-alive references taken in
++	 * visp_pad_s_stream() and perform the real upstream teardown
++	 * (sensor s_stream(0), camera disconnect, pipeline destroy)
++	 * that is otherwise deferred to module unload.
++	 *
++	 * By the time visp_remove() is called every video node should
++	 * already be closed, so the per-channel out paths and cam_device
++	 * buffer pools have already been torn down by media_isp_stream_off().
++	 * The only remaining references on subdev_streamon_count[] are the
++	 * keep-alive pins themselves, so dropping each pin should take the
++	 * count back to 0 and let the existing teardown path run.
++	 */
++	for (port = 0; port < MEDIA_ISP_PORT_MAX; port++) {
++		if (!ISP_DEV_EXTENDED(isp_dev)->keep_alive_ref_held[port])
++			continue;
++
++		mutex_lock(&isp_dev->rpu->rpu_lock);
++
++		ISP_DEV_EXTENDED(isp_dev)->keep_alive_ref_held[port] = false;
++		if (ISP_DEV_EXTENDED(isp_dev)->subdev_streamon_count[port])
++			ISP_DEV_EXTENDED(isp_dev)->subdev_streamon_count[port]--;
++
++		if (ISP_DEV_EXTENDED(isp_dev)->subdev_streamon_count[port] == 0) {
++			int ret;
++
++			/* Mirror the cleanup that media_isp_stream_off() would
++			 * have done on the very last per-channel stream-off if
++			 * the keep-alive pin had not been holding the count up.
++			 */
++			media_isp_device_camera_dis_connect(isp_dev, port, 0);
++			isp_destroy_pipeline(isp_dev, port, 0);
++
++			ret = visp_stream_pipeline_subdevs(isp_dev, port, 0);
++			if (ret)
++				dev_warn(isp_dev->dev,
++					 "Keep-alive teardown: pipeline stop failed on port %d: %d\n",
++					 port, ret);
++			else
++				dev_info(isp_dev->dev,
++					 "Keep-alive pin released and pipeline stopped on port %d\n",
++					 port);
++		}
++
++		mutex_unlock(&isp_dev->rpu->rpu_lock);
++	}
++}
++
+ static void visp_remove(struct platform_device *pdev)
+ {
+ 	struct visp_dev *isp_dev;
+ 
+ 	isp_dev = platform_get_drvdata(pdev);
+ 
++	visp_release_keep_alive_pins(isp_dev);
++
+ 	visp_procfs_unregister(isp_dev->pde);
+ 	v4l2_async_unregister_subdev(&isp_dev->sd);
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 16, 0)
+diff --git a/visp/visp_driver.h b/visp/visp_driver.h
+index 4ac6795..e606214 100644
+--- a/visp/visp_driver.h
++++ b/visp/visp_driver.h
+@@ -219,6 +219,17 @@ enum isp_mode {
+ struct visp_limo_isp_dev_extended {
+ 	int id;
+ 	int subdev_streamon_count[VISP_PORT_PAD_NR];
++	/*
++	 * Keep-alive: on the first stream-on for a given port we add an
++	 * extra reference to subdev_streamon_count[port] so it can never
++	 * reach 0 during normal open/close cycles of the /dev/videoN nodes.
++	 * This keeps the upstream sensor pipeline + RPU camera connection
++	 * (and the previously programmed framerate) running across client
++	 * disconnects.  The per-channel out path + cam_device buffer pool
++	 * is still torn down on stream-off so vb2 buffers can be freed
++	 * safely.  The reference is released only at module-remove time.
++	 */
++	bool keep_alive_ref_held[MEDIA_ISP_PORT_MAX];
+ };
+ 
+ static inline enum isp_mode get_isp_mode_from_str(const char *mode_str)
+diff --git a/visp_mbox/visp_mbox_driver.c b/visp_mbox/visp_mbox_driver.c
+index e9a6232..23f39d6 100644
+--- a/visp_mbox/visp_mbox_driver.c
++++ b/visp_mbox/visp_mbox_driver.c
+@@ -235,6 +235,11 @@ static ssize_t visp_mbox_rpudev_write(struct file *file, const char __user *buf,
+ 	memcpy(&instance_id, p_data, sizeof(uint32_t));
+ 
+ 	mutex_lock(&rpu->write_lock); // Replaced spinlock with mutex
++
++	// ADD HERE - Shows what user space is sending
++    pr_info("[MBOX_DEBUG] User write: cmd_id=%d, dest_core=%d, rpu_id=%d\n",
++            user_packet->cmd_id, rpu->core_id, rpu->rpu_id);
++			
+ 	/* Send command and message */
+ 	ret = visp_mbox_send_command(user_packet->cmd_id, packet,
+ 				     sizeof(payload_packet), rpu->core_id,
+@@ -437,17 +442,21 @@ uint8_t xlnx_mbox_apu_wait_for_data(struct visp_dev *isp_dev, void *data)
+ 
+ 	long timeout_jiffies =
+ 	    msecs_to_jiffies(1000 * 60 * 5); // Timeout of 5000ms (5 seconds)
+-	result = wait_for_completion_interruptible_timeout(
++	/*
++	 * Use the non-interruptible variant on purpose: this wait runs in
++	 * a syscall context that has already pushed a command into the
++	 * APU->RPU mailbox.  If a userspace SIGINT (Ctrl-C) aborted the
++	 * wait we would unwind while the RPU is still mid-transaction,
++	 * leaving the mailbox FIFO and the RPU's view of the camera/sensor
++	 * state desynchronized.  The 5-minute timeout still bounds the wait.
++	 */
++	result = wait_for_completion_timeout(
+ 	    &isp_dev->apu_wait_for_data, timeout_jiffies);
+ 	if (result == 0) {
+ 		dev_err(rpu->dev,
+ 			"Timeout occurred while waiting for APU ACK\n");
+ 		ret = -ETIMEDOUT;
+ 		goto ERROR;
+-	} else if (result < 0) {
+-		dev_err(rpu->dev, "Wait interrupted\n");
+-		ret = -EINVAL;
+-		goto ERROR;
+ 	}
+ 
+ 	mutex_unlock(&rpu->write_lock);
+@@ -640,17 +649,20 @@ uint8_t xlnx_mbox_apu_wait_for_ack(struct visp_dev *isp_dev)
+ 	/* Wait for acknowledgment completion */
+ 	long timeout_jiffies =
+ 	    msecs_to_jiffies(1000 * 60 * 5); // Timeout of 5000ms (5 seconds)
+-	result = wait_for_completion_interruptible_timeout(
++	/*
++	 * Non-interruptible on purpose -- see xlnx_mbox_apu_wait_for_data().
++	 * A SIGINT here would abandon an outstanding APU->RPU command and
++	 * desync the mailbox / RPU state machine, which then breaks every
++	 * subsequent stream-on attempt.  The 5-minute timeout still bounds
++	 * the wait.
++	 */
++	result = wait_for_completion_timeout(
+ 	    &isp_dev->apu_wait_for_ack, timeout_jiffies);
+ 	if (result == 0) {
+ 		dev_err(rpu->dev,
+ 			"Timeout occurred while waiting for APU ACK\n");
+ 		ret = -ETIMEDOUT;
+ 		goto ERROR;
+-	} else if (result < 0) {
+-		dev_err(rpu->dev, "Wait interrupted\n");
+-		ret = -1;
+-		goto ERROR;
+ 	}
+ 
+ 	if (!kfifo_out(&rpu->ack_fifo, &msg, 1)) {

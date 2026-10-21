@@ -1,0 +1,645 @@
+From 4cb83f7188981caa5c140965eb83ea172db35e64 Mon Sep 17 00:00:00 2001
+From: Kush Jain <kush.jain@amd.com>
+Date: Thu, 23 Jul 2026 00:00:00 -0700
+Subject: [PATCH] xilpm_ng: server: FPD power-down/resume rebased
+ for 2026.1
+
+Rebase of the reference FPD power-cycle handoff patch onto the 2026.1
+embeddedsw tree (ESW_REV[2026.1] = 2fb454742f9d42e23a46a13c0eb09e29dc52c6d1).
+
+Features (unchanged from the original master-next handoff):
+- PowerUp/PowerDwn sequences for the FPD power domain (GPIO domain control)
+- request/release of ACPU core clocks
+- PMC GIC Proxy wake with RTC alarm
+- RequestWakeUp of core0
+- OSPI clock re-init in loader Init(); FPD timestamp-counter re-init on resume;
+  OSPI 1-1-1 mode restore before Linux handoff
+- MMI devices removed from the Default Subsystem prealloc list
+
+Delta vs the original patch: the xpm_gic_proxy.c hunk (size the GIC-proxy
+group cache 5 -> 8 so RTC/GPIO_PMC/SDIO/PMC_WWDT groups 5..7 fit) is DROPPED
+because 2026.1 embeddedsw already ships that change (XPm_GicProxyGroups[8]).
+xpm_api.c applies at a +9-line offset; all other hunks are byte-identical.
+
+Requires the PLM to be built with SUBSYS mode and the
+XILPM_NG_DOMAIN_CONTROL_GPIO option, plus a board-topology CDO added to the
+boot image to configure the FPD-rail GPIO (MIO) pins.
+
+Signed-off-by: Kush Jain <kush.jain@amd.com>
+Rebased-by: ERICA Sentry <root@amd-ecp>
+---
+ .../src/common/server/xloader_ospi.c          |   8 +
+ .../src/xilpm_boot/versal_2ve_2vm/xpm_api.c   |   5 +
+ .../xilpm_boot/versal_2ve_2vm/xpm_apucore.c   |   4 +
+ .../versal_2ve_2vm/xpm_powerdomain.c          | 261 +++++++++++++++++-
+ .../versal_2ve_2vm/xpm_psfpdomain.c           |   3 +
+ .../src/xilpm_runtime/src/xpm_device_fsm.c    |  18 +-
+ .../src/xilpm_runtime/src/xpm_runtime_api.c   | 101 ++++++-
+ .../src/xilpm_runtime/src/xpm_runtime_clock.c |   7 +
+ 8 files changed, 382 insertions(+), 25 deletions(-)
+
+diff --git a/lib/sw_services/xilloader/src/common/server/xloader_ospi.c b/lib/sw_services/xilloader/src/common/server/xloader_ospi.c
+index 3cf88dd..aeea060 100644
+--- a/lib/sw_services/xilloader/src/common/server/xloader_ospi.c
++++ b/lib/sw_services/xilloader/src/common/server/xloader_ospi.c
+@@ -331,6 +331,14 @@ int XLoader_OspiInit(u32 DeviceFlags)
+ 		goto END;
+ 	}
+ 
++	/* Re-enable OSPI reference clock if gated by Linux */
++	{
++		u32 RefCtrl = XPlmi_In32(0xF1260120U);
++		if (0U == (RefCtrl & BIT(24U))) {
++			XPlmi_Out32(0xF1260120U, RefCtrl | BIT(24U));
++		}
++	}
++
+ 	/**
+ 	 * - Initialize the OSPI instance.
+ 	*/
+diff --git a/lib/sw_services/xilpm_ng/src/xilpm_boot/versal_2ve_2vm/xpm_api.c b/lib/sw_services/xilpm_ng/src/xilpm_boot/versal_2ve_2vm/xpm_api.c
+index f1af095..37173e6 100644
+--- a/lib/sw_services/xilpm_ng/src/xilpm_boot/versal_2ve_2vm/xpm_api.c
++++ b/lib/sw_services/xilpm_ng/src/xilpm_boot/versal_2ve_2vm/xpm_api.c
+@@ -804,6 +804,11 @@ static XStatus AddPeriphDevice(const u32 *Args, u32 PowerId)
+ 		goto done;
+ 	}
+ 
++	/* TODO: FIXME: This information should come from device topology */
++	if (PM_DEV_RTC == DeviceId) {
++		GicProxyMask = 0x300U;
++	}
++
+ 	if ((u32)XPM_NODETYPE_DEV_HB_MON == Type) {
+ 		Device = (XPm_Device *)XPm_AllocBytes(sizeof(XPm_Device));
+ 		if (NULL == Device) {
+diff --git a/lib/sw_services/xilpm_ng/src/xilpm_boot/versal_2ve_2vm/xpm_apucore.c b/lib/sw_services/xilpm_ng/src/xilpm_boot/versal_2ve_2vm/xpm_apucore.c
+index e029905..0096511 100644
+--- a/lib/sw_services/xilpm_ng/src/xilpm_boot/versal_2ve_2vm/xpm_apucore.c
++++ b/lib/sw_services/xilpm_ng/src/xilpm_boot/versal_2ve_2vm/xpm_apucore.c
+@@ -6,6 +6,7 @@
+ #include "xil_io.h"
+ #include "xpm_apucore.h"
+ #include "xpm_core.h"
++#include "xpm_runtime_clock.h"
+ #include "xpm_regs.h"
+ #include "xpm_debug.h"
+ #include "xpm_psfpdomain.h"
+@@ -93,8 +94,11 @@ XStatus XPmApuCore_PwrDwn(XPm_Core *Core)
+ 	Status = XPmCore_PwrDwn(Core);
+ 	if (XST_SUCCESS != Status) {
+ 		PmErr("Status = %x\r\n", Status);
++		goto done;
+ 	}
+ 
++	/* Core Clocks will be released by DirectPwrUp/AfterDirectPwrDwn */
++
+ done:
+ 	return Status;
+ }
+diff --git a/lib/sw_services/xilpm_ng/src/xilpm_boot/versal_2ve_2vm/xpm_powerdomain.c b/lib/sw_services/xilpm_ng/src/xilpm_boot/versal_2ve_2vm/xpm_powerdomain.c
+index 4de9719..1d1d2fb 100644
+--- a/lib/sw_services/xilpm_ng/src/xilpm_boot/versal_2ve_2vm/xpm_powerdomain.c
++++ b/lib/sw_services/xilpm_ng/src/xilpm_boot/versal_2ve_2vm/xpm_powerdomain.c
+@@ -20,11 +20,41 @@
+ #include "xpm_debug.h"
+ #include "xpm_err.h"
+ #include "xpm_domain_iso.h"
++#include "xpm_gic_proxy.h"
+ #include "xpm_pmc.h"
+ #ifdef PLM_ENABLE_STL
+ #include "xstl_plminterface.h"
+ #endif
+ 
++#define AMS_ROOT_BASE              0xF1270000U
++#define AMS_ROOT_PCSR_LOCK         (AMS_ROOT_BASE + 0x0000000CU)
++#define AMS_ROOT_TOKEN_MNGR        (AMS_ROOT_BASE + 0x00000104U)
++#define PCSR_UNLOCK_VAL            0xF9E8D7C6U
++#define PCSR_LOCK_VAL              0x00000000U
++#define AMS_BYPASS_FPD_MASK        0x00040000U
++
++/**
++ * EAM (Error Aggregation Module) mask for FPD power cycle.
++ *
++ * When FPD rail is cut, APU PLLs lose lock and fire EAM errors
++ * 0x65/0x66 (APLL1/APLL2 lock-loss) on ERR0 bits 5-6.  These
++ * are expected hardware behavior (PLL has no power) but if left
++ * unmasked, PLM's EAM IRQ handler loops on them and can wedge
++ * the scheduler — preventing RTC GIC Proxy wake dispatch.
++ *
++ * Masked on PMC3 (IRQ routing group) before FPD power-off in
++ * XPm_PowerDwnFPD, unmasked in XPm_PowerUpFPD.
++ * PMC3 is the group routed to PLM's IRQ — confirmed by
++ * xplmi_err.c:1190: "PMC3_EAMx .. is routed to IRQ".
++ *
++ * Register layout (LPD_SLCR EAM, per PMC routing group):
++ *   MASK = base (read-only), EN = MASK+0x20, DIS = MASK+0x40
++ */
++#define EAM_PMC3_ERR0_MASK_REG    (LPD_SLCR_BASEADDR + 0x00040160U)
++#define EAM_EN_OFFSET             0x20U
++#define EAM_DIS_OFFSET            0x40U
++#define EAM_APLL_LOCK_LOSS_MASK   0x00000060U
++
+ #define SYSMON_CHECK_POWER_TIMEOUT	2000000U
+ 
+ /* If Sysmon low threshold registers are not used they will be programmed to 0.
+@@ -111,14 +141,14 @@ static XPm_DomainAmsTrimOp XPmPowerDomain_GetAmsTrimOp(u32 DomainId)
+ }
+ 
+ /**
+- * @brief 	Helper function to perform PL domain reset actions (assert/de-assert)
++ * @brief 	Helper function to perform power domain reset actions (assert/de-assert)
+  *
+- * @param RstNodeId 	Node Id to assert reset for PL Power Domain
++ * @param RstNodeId 	Node Id to assert reset for Power Domain
+  * @param Action	Reset action to be performed (assert/de-assert)
+  *
+  * @return XST_SUCCESS if successful else XST_FAILURE or error code
+  */
+-static inline XStatus PLRstAction(u32 RstNodeId, u32 Action) {
++static inline XStatus PwrDomainRstAction(u32 RstNodeId, u32 Action) {
+ 	XStatus Status = XST_FAILURE;
+ 	XPm_ResetNode *Rst = XPmReset_GetById(RstNodeId);
+ 	u32 ControlReg = 0x0UL;
+@@ -251,21 +281,226 @@ XStatus XPm_PowerDwnLPD(void)
+ XStatus XPm_PowerUpFPD(const XPm_Node *Node)
+ {
+ 	XStatus Status = XST_FAILURE;
++	u16 DbgErr = XPM_INT_ERR_UNDEFINED;
++	const XPm_PsFpDomain *FpDomain = NULL;
+ 
+-	/* TODO: Add Power up sequence for FPD */
+-	(void)Node;
+-	Status = XST_SUCCESS;
++	/**
++	 * Perform the FPD power up sequence
++	 *
++	 * - CDO takes care of the sequence,
++	 * 	only perform HW PowerUp
++	*/
++
++	if (NULL == Node) {
++		DbgErr = XPM_INT_ERR_INVALID_NODE;
++		Status = XST_FAILURE;
++		goto done;
++	}
++
++	FpDomain = (XPm_PsFpDomain *)XPmPower_GetById(Node->Id);
++	if (NULL == FpDomain) {
++		Status = XPM_INVALID_PWRDOMAIN;
++		DbgErr = XPM_INT_ERR_INVALID_PWR_DOMAIN;
++		goto done;
++	}
++
++	xil_printf("[FPD] Powering Up FPD\r\n");
++	Status = XPmPower_UpdateDomainPower(&FpDomain->Domain, XPM_POWER_STATE_ON);
++	if (XST_SUCCESS != Status) {
++		DbgErr = XPM_INT_ERR_FPD_RAIL_CONTROL;
++		goto done;
++	}
+ 
++	/* TODO: FIXME: Following Reset Nodes are not present in Device Topology yet! */
++	// Status = PwrDomainRstAction(PM_RST_FPD_SRST, XPM_RST_STATE_DEASSERTED);
++	// if (XST_SUCCESS != Status) {
++	// 	DbgErr = XPM_INT_ERR_RST_RELEASE;
++	// 	goto done;
++	// }
++	// Status = PwrDomainRstAction(PM_RST_FPD_POR, XPM_RST_STATE_DEASSERTED);
++	// if (XST_SUCCESS != Status) {
++	// 	DbgErr = XPM_INT_ERR_RST_RELEASE;
++	// 	goto done;
++	// }
++
++	/**
++	 * Unmask APLL lock-loss errors masked in XPm_PowerDwnFPD.
++	 * FPD is back up, APLLs are locked — safe to re-enable.
++	 */
++	PmOut32(EAM_PMC3_ERR0_MASK_REG + EAM_EN_OFFSET,
++		EAM_APLL_LOCK_LOSS_MASK);
++
++done:
++	XPm_PrintDbgErr(Status, DbgErr);
+ 	return Status;
+ }
+ 
+ XStatus XPm_PowerDwnFPD(const XPm_Node *Node)
+ {
+ 	XStatus Status = XST_FAILURE;
++	XStatus HasResumeAddrStatus = XST_FAILURE;
++	u32 DbgErr = (u32)XPM_INT_ERR_UNDEFINED;
+ 
+-	/* TODO: Add Power down sequence for FPD */
+-	(void)Node;
+-	Status = XST_SUCCESS;
++	xil_printf("[FPD] Powering Down FPD\r\n");
++	/* Flush subsystem state before FPD power-off */
++	Status = XPmSubsystem_CmnFlush(PM_SUBSYS_DEFAULT);
++	if (XST_SUCCESS != Status) {
++		xil_printf("[FPD] Subsystem flush failed before FPD power down, rc=0x%x\r\n", Status);
++		goto done;
++	}
++
++	const XPm_Core *ApuCore = NULL;
++	const XPm_Device *AmsRoot = NULL;
++	const XPm_PsFpDomain *FpDomain = NULL;
++
++	AmsRoot = XPmDevice_GetById(PM_DEV_AMS_ROOT);
++	if (NULL == AmsRoot) {
++		DbgErr = (u32)XPM_INT_ERR_INVALID_DEVICE;
++		goto done;
++	}
++
++	/* Unlock configuration and system registers for write operation */
++	/* TODO: FIXME: AmsRoot object not populated in xilpm_ng */
++	// XPm_UnlockPcsr(AmsRoot->Node.BaseAddress);
++	PmOut32(AMS_ROOT_PCSR_LOCK, PCSR_UNLOCK_VAL);
++
++	// PmRmw32(AmsRoot->Node.BaseAddress + 0x00000104,
++	// 	0x00040000, 0x00040000);
++	PmRmw32(AMS_ROOT_TOKEN_MNGR,
++        AMS_BYPASS_FPD_MASK,
++        AMS_BYPASS_FPD_MASK);
++
++	/* Lock configuration and system registers */
++	// XPm_LockPcsr(AmsRoot->Node.BaseAddress);
++	PmOut32(AMS_ROOT_PCSR_LOCK, PCSR_LOCK_VAL);
++
++	/* disable CRL Write Protections */
++	PmOut32(PSX_CRL_BASEADDR + PSX_CRL_WPROT_OFFSET, 0U);
++	/* disable LPD SLCR Write Protections */
++	PmOut32(LPD_SLCR_BASEADDR, 0U);
++	/* disable CRP Write Protections */
++	PmOut32(CRP_BASEADDR + CRP_WPROT_OFFSET, 0U);
++
++	/**
++	 * Mask EAM errors that fire during FPD power cycle.
++	 * Must be AFTER LPD_SLCR write-protection disable — EAM
++	 * registers are in the LPD_SLCR address space (0xEB45xxxx).
++	 *
++	 * APLL lock-loss (ERR0 bits 5,6): APU PLLs lose lock when FPD
++	 * rail is cut.  If unmasked, PLM's EAM IRQ handler loops on
++	 * them and wedges the scheduler — RTC wake never dispatched.
++	 *
++	 * MMI correctable (ERR3 bits 10,12,13,15): MMI peripherals
++	 * post correctable events during CDO replay on resume.
++	 * Non-fatal but produces noisy log lines.
++	 *
++	 * Mask APLL lock-loss on PMC0 before cutting FPD rail.
++	 * Unmasked in XPm_PowerUpFPD after FPD is back.
++	 */
++	PmOut32(EAM_PMC3_ERR0_MASK_REG + EAM_DIS_OFFSET,
++		EAM_APLL_LOCK_LOSS_MASK);
++
++	/* Isolate: FPD-NOC */
++	Status = XPmDomainIso_Control((u32)XPM_NODEIDX_ISO_FPD_SOC, TRUE_VALUE);
++	if (XST_SUCCESS != Status) {
++		DbgErr = XPM_INT_ERR_PMC_PL_CFRAME_ISO;
++		goto done;
++	}
++
++	/* Isolate: FPD-LPD */
++	Status = XPmDomainIso_Control((u32)XPM_NODEIDX_ISO_LPD_FPD, TRUE_VALUE);
++	if (XST_SUCCESS != Status) {
++		DbgErr = XPM_INT_ERR_PMC_PL_CFRAME_ISO;
++		goto done;
++	}
++
++	/* Isolate: FPD-LPD_DFX */
++	Status = XPmDomainIso_Control((u32)XPM_NODEIDX_ISO_LPD_FPD_DFX, TRUE_VALUE);
++	if (XST_SUCCESS != Status) {
++		DbgErr = XPM_INT_ERR_PMC_PL_CFRAME_ISO;
++		goto done;
++	}
++
++	/* Isolate: FPD-PL */
++	Status = XPmDomainIso_Control((u32)XPM_NODEIDX_ISO_FPD_PL_TEST, TRUE_VALUE);
++	if (XST_SUCCESS != Status) {
++		DbgErr = XPM_INT_ERR_PMC_PL_CFRAME_ISO;
++		goto done;
++	}
++	
++	/* Isolate: FPD-PL_TEST */
++	Status = XPmDomainIso_Control((u32)XPM_NODEIDX_ISO_FPD_PL, TRUE_VALUE);
++	if (XST_SUCCESS != Status) {
++		DbgErr = XPM_INT_ERR_PMC_PL_CFRAME_ISO;
++		goto done;
++	}
++
++	/* Isolate: FPD-MMI */
++	/* TODO: FIXME: Missing */
++
++	/* Isolate: FPD-MMI_DFX */
++	/* TODO: FIXME: Missing */
++
++	/* TODO: FIXME: Following Reset Nodes are not present in Device Topology yet! */
++	// Status = PwrDomainRstAction(PM_RST_FPD_SRST, XPM_RST_STATE_ASSERTED);
++	// if (XST_SUCCESS != Status) {
++	// 	DbgErr = XPM_INT_ERR_RST_RELEASE;
++	// 	goto done;
++	// }
++	// Status = PwrDomainRstAction(PM_RST_FPD_POR, XPM_RST_STATE_ASSERTED);
++	// if (XST_SUCCESS != Status) {
++	// 	DbgErr = XPM_INT_ERR_RST_RELEASE;
++	// 	goto done;
++	// }
++	/* PSX_CRL.RST_FPX: assert FPD SRST */
++	PmRmw32(0xEB5E03D0U, 0x2U, 0x2U);
++
++	/* set reset value for LPD SLCR Scan Clear Trigger */
++	PmOut32(PSXC_LPX_SLCR_SCAN_CLEAR_TRIGGER, 0U);
++
++	/* set reset value for LPD SCLR Mem Clear Trigger */
++	PmOut32(PSXC_LPX_SLCR_MEM_CLEAR_TRIGGER, 0U);
++
++	/* set reset value for CRP XDP Control */
++	/* TODO: FIXME: MACROs missing */
++	PmRmw32(CRP_BASEADDR + 0x100U, 0x3FF00U, 0x200U);
++
++	FpDomain = (XPm_PsFpDomain *)XPmPower_GetById(Node->Id);
++	if (NULL == FpDomain) {
++		Status = XPM_INVALID_PWRDOMAIN;
++		DbgErr = XPM_INT_ERR_INVALID_PWR_DOMAIN;
++		goto done;
++	}
++
++	/* Rail Update Status */
++	Status = XPmPower_UpdateDomainPower(&FpDomain->Domain, XPM_POWER_STATE_OFF);
++	if (XST_SUCCESS != Status) {
++		DbgErr = XPM_INT_ERR_FPD_RAIL_CONTROL;
++		goto done;
++	}
++	xil_printf("[FPD] GPIO FPD OFF done\r\n");
++
++	/* Enable GIC Proxy? */
++	ApuCore = (XPm_Core *)XPmDevice_GetById(PM_DEV_ACPU_0_0);
++	if (NULL != ApuCore) {
++		HasResumeAddrStatus = XPmCore_HasResumeAddr(ApuCore);
++		if (XST_SUCCESS == HasResumeAddrStatus) {
++			/* Enable GIC proxy only if resume path is set */
++			xil_printf("[FPD] Enabling GIC Proxy\r\n");
++			XPm_GicProxy.Enable();
++		}
++		else {
++			DbgErr = (u32)XPM_INT_ERR_INVALID_ADDR;
++		}
++	}
++
++done:
++	/* enable CRL Write Protections */
++	PmOut32(PSX_CRL_BASEADDR + PSX_CRL_WPROT_OFFSET, 1U);
++	/* enable LPD SLCR Write Protections */
++	PmOut32(LPD_SLCR_BASEADDR, 1U);
++	/* enable CRP Write Protections */
++	PmOut32(CRP_BASEADDR + CRP_WPROT_OFFSET, 1U);
+ 
+ 	return Status;
+ }
+@@ -307,12 +542,12 @@ XStatus XPm_PowerUpPLD(XPm_Node *Node)
+ 	 * change Reset Node change to de-asserted for software sync
+ 	 * ( actual reset de-assertion is done by CDO )
+ 	*/
+-	Status = PLRstAction(PM_RST_PL_POR, XPM_RST_STATE_DEASSERTED);
++	Status = PwrDomainRstAction(PM_RST_PL_POR, XPM_RST_STATE_DEASSERTED);
+ 	if (XST_SUCCESS != Status) {
+ 		DbgErr = XPM_INT_ERR_RST_RELEASE;
+ 		goto done;
+ 	}
+-	Status = PLRstAction(PM_RST_PL_SRST, XPM_RST_STATE_DEASSERTED);
++	Status = PwrDomainRstAction(PM_RST_PL_SRST, XPM_RST_STATE_DEASSERTED);
+ 	if (XST_SUCCESS != Status) {
+ 		DbgErr = XPM_INT_ERR_RST_RELEASE;
+ 		goto done;
+@@ -420,13 +655,13 @@ XStatus XPm_PowerDwnPLD(const XPm_Node *Node)
+ 
+ 	/* Extract needed logic from XPmReset_AssertbyId() to boot module */
+ 	/* Assert POR PL */
+-	Status = PLRstAction(PM_RST_PL_POR, XPM_RST_STATE_ASSERTED);
++	Status = PwrDomainRstAction(PM_RST_PL_POR, XPM_RST_STATE_ASSERTED);
+ 	if (XST_SUCCESS != Status) {
+ 		DbgErr = XPM_INT_ERR_RST_ASSERT;
+ 		goto done;
+ 	}
+ 	/* Assert SRST PL */
+-	Status = PLRstAction(PM_RST_PL_SRST, XPM_RST_STATE_ASSERTED);
++	Status = PwrDomainRstAction(PM_RST_PL_SRST, XPM_RST_STATE_ASSERTED);
+ 	if (XST_SUCCESS != Status) {
+ 		DbgErr = XPM_INT_ERR_RST_ASSERT;
+ 		goto done;
+diff --git a/lib/sw_services/xilpm_ng/src/xilpm_boot/versal_2ve_2vm/xpm_psfpdomain.c b/lib/sw_services/xilpm_ng/src/xilpm_boot/versal_2ve_2vm/xpm_psfpdomain.c
+index 56503d2..5440267 100644
+--- a/lib/sw_services/xilpm_ng/src/xilpm_boot/versal_2ve_2vm/xpm_psfpdomain.c
++++ b/lib/sw_services/xilpm_ng/src/xilpm_boot/versal_2ve_2vm/xpm_psfpdomain.c
+@@ -23,6 +23,9 @@ XStatus FpdInitStart(XPm_PowerDomain *PwrDomain, const u32 *Args,
+ 
+ 	const XPm_Rail *VccintPsfpRail = (XPm_Rail *)XPmPower_GetById(PM_POWER_VCCINT_PSFP);
+ 
++	/* HACK: wait for rail to ramp-up */
++	usleep(250000);
++
+ 	/* Check vccint_fpd first to make sure power is on */
+ 	Status = XPmPower_CheckPower(VccintPsfpRail,
+ 				     PMC_GLOBAL_PWR_SUPPLY_STATUS_VCCINT_FPD_MASK);
+diff --git a/lib/sw_services/xilpm_ng/src/xilpm_runtime/src/xpm_device_fsm.c b/lib/sw_services/xilpm_ng/src/xilpm_runtime/src/xpm_device_fsm.c
+index 1154eaf..634b393 100644
+--- a/lib/sw_services/xilpm_ng/src/xilpm_runtime/src/xpm_device_fsm.c
++++ b/lib/sw_services/xilpm_ng/src/xilpm_runtime/src/xpm_device_fsm.c
+@@ -74,18 +74,24 @@ static XStatus ActionBringUpAll(XPm_Device* Device)
+ 		PmErr("Bring up device failed!\n");
+ 		goto done;
+ 	}
++	/**
++	 * Skip clock request and reset release for core devices.
++	 * Core clocks are managed solely by DirectPwrUp (request)
++	 * and AfterDirectPwrDwn (release), keeping a symmetric
++	 * 1:1 UseCount per suspend-resume cycle.
++	 */
++	if (((u32)XPM_NODECLASS_DEVICE == NODECLASS(Device->Node.Id)) &&
++	    ((u32)XPM_NODESUBCL_DEV_CORE == NODESUBCLASS(Device->Node.Id))) {
++		Status = XST_SUCCESS;
++		goto done;
++	}
++
+ 	/** Start clocks */
+ 	Status = SetClocks(Device, 1U);
+ 	if (XST_SUCCESS != Status) {
+ 		PmErr("clock set failed!\n");
+ 		goto done;
+ 	}
+-	/** Skip releasing reset if device is core type; since it is done as the part of request wakeup */
+-	if (((u32)XPM_NODECLASS_DEVICE == NODECLASS(Device->Node.Id)) &&
+-	    ((u32)XPM_NODESUBCL_DEV_CORE == NODESUBCLASS(Device->Node.Id))) {
+-		Status = XST_SUCCESS;
+-		goto done;
+-	}
+ 
+ 	/** Release reset for peripheral and TCM devices */
+ 	if (((u32)XPM_NODESUBCL_DEV_PERIPH == NODESUBCLASS(Device->Node.Id)) ||
+diff --git a/lib/sw_services/xilpm_ng/src/xilpm_runtime/src/xpm_runtime_api.c b/lib/sw_services/xilpm_ng/src/xilpm_runtime/src/xpm_runtime_api.c
+index 8583946..5917f3c 100644
+--- a/lib/sw_services/xilpm_ng/src/xilpm_runtime/src/xpm_runtime_api.c
++++ b/lib/sw_services/xilpm_ng/src/xilpm_runtime/src/xpm_runtime_api.c
+@@ -438,21 +438,40 @@ done:
+ static XStatus XPm_GicProxyWakeUp(const u32 PeriphIdx)
+ {
+ 	XStatus Status = XST_FAILURE;
++	u32 WakeProcId = 0U;
+ 
+-	const XPmRuntime_Periph *Periph = (XPmRuntime_Periph *)XPmDevice_GetByIndex(PeriphIdx);
+-	if ((NULL == Periph) || (0U == Periph->WakeProcId)) {
++	XPm_Periph *Periph = (XPm_Periph *)XPmDevice_GetByIndex(PeriphIdx);
++	if (NULL == Periph) {
+ 		goto done;
+ 	}
+ 
+-	XPm_Core *Core = (XPm_Core *)XPmDevice_GetById(Periph->WakeProcId);
++	Status = XPmRuntime_Periph_GetWakeProcId(Periph, &WakeProcId);
++	if ((XST_SUCCESS != Status) || (0U == WakeProcId)) {
++		Status = XST_FAILURE;
++		goto done;
++	}
++
++	XPm_Core *Core = (XPm_Core *)XPmDevice_GetById(WakeProcId);
++	if (NULL == Core) {
++		Status = XST_FAILURE;
++		goto done;
++	}
+ 
+-	/* Do not process anything if core is already running */
+ 	if ((u8)XPM_DEVSTATE_RUNNING == Core->Device.Node.State) {
+ 		Status = XST_SUCCESS;
+ 		goto done;
+ 	}
+ 
+-	Status = XPmCore_RequestWakeup(Core, 0, 0);
++	/*
++	 * Complete pending self-suspend resume: restore FPD power
++	 * and directly power up the core. Do NOT use XPm_RequestWakeUp
++	 * which goes through the full device FSM (ActionBringUpAll)
++	 * treating it as a fresh cold wake — ATF expects a
++	 * suspend-resume completion, not a new device request.
++	*/
++	xil_printf("[FPD] XPm_RequestWakeUp: core 0x%08x, resume-addr: 0x%08x, rc= 0x%x\r\n", WakeProcId, Core->ResumeAddr, Status);
++	Status = XPm_RequestWakeUp(PM_SUBSYS_DEFAULT, WakeProcId, 0, 0, 0,
++					XPLMI_CMD_SECURE);
+ 
+ done:
+ 	return Status;
+@@ -500,6 +519,9 @@ int XPm_RegisterWakeUpHandlers(void)
+ 	XPm_RegisterWakeUpHandler((u32)XPLMI_PMC_GIC_IRQ_GICP1, (u32)XPLMI_GICP1_SRC6, XPM_NODEIDX_DEV_USB_1);
+ 	XPm_RegisterWakeUpHandler((u32)XPLMI_PMC_GIC_IRQ_GICP5, (u32)XPLMI_GICP1_SRC4, XPM_NODEIDX_DEV_MMI_GEM);
+ 
++	/* RTC alarm on GICP6 src8 */
++	XPm_RegisterWakeUpHandler((u32)XPLMI_PMC_GIC_IRQ_GICP6, 8U, XPM_NODEIDX_DEV_RTC);
++
+ END:
+ 	return Status;
+ }
+@@ -1437,6 +1459,21 @@ static XStatus XPm_AddReqsDefaultSubsystem(XPm_Subsystem *Subsystem)
+ 		/* Always use maximum capability and secure if applies */
+ 		Capability = XPM_MAX_CAPABILITY | PM_CAP_SECURE;
+ 
++		/* HACK: don't prealloc MMI devices as MMI drivers do not properly release them on suspend-path ( causing FPD UseCount > 0 )*/
++		switch (Device->Node.Id) {
++		case PM_DEV_MMI_USB_DRD:
++		case PM_DEV_MMI_GPU:
++		case PM_DEV_MMI_DC:
++		case PM_DEV_MMI_HDCP:
++		case PM_DEV_MMI_DP:
++		case PM_DEV_MMI_GEM:
++			Prealloc = 0U;
++			Capability = 0U;
++			break;
++		default:
++			break;
++	}
++
+ 		/**
+ 		 * Since default subsystem is hard-coded for now, add security policy
+ 		 * for all peripherals as REQ_ACCESS_SECURE. This allows any device
+@@ -2343,8 +2380,59 @@ XStatus XPm_RequestWakeUp(u32 SubsystemId, const u32 DeviceId,
+ 						goto done;
+ 					}
+ 				}
++
++				/* If APU Cores are requested to wakeup */
++				if ((u32)XPM_NODETYPE_DEV_CORE_APU == NODETYPE(CoreDeviceId)) {
++					Power = XPmPower_GetById(PM_POWER_FPD);
++					if ((NULL != Power) && ((u8)XPM_POWER_STATE_OFF == Power->Node.State)) {
++						xil_printf("[FPD] Powering Up FPD (GPIO ON + CDO replay)\r\n");
++						Status = XPm_RestartCbWrapper(Power->Node.Id);
++						if (XST_SUCCESS != Status) {
++							xil_printf("[FPD] CDO replay FAIL: 0x%x\r\n", Status);
++							goto done;
++						}
++						xil_printf("[FPD] FPD CDO replay done\r\n");
++
++						/* Re-enable FPD system timestamp counter.
++						 * CDO releases timestamp reset (PSX_CRF_RST_TIMESTAMP=0)
++						 * but does not program frequency or enable the counter.
++						 * TF-A config_setup() does that on cold boot only. */
++						XPlmi_Out32(0xEC920020U, 0x05F5DD19U);
++						XPlmi_Out32(0xEC920000U, 1U);
++
++						XPm_GicProxy.Clear();
++
++						/* Reset OSPI flash back to 1-1-1 mode.
++						 * PLM's XLoader_OspiInit switches the flash to 8D-8D-8D
++						 * (octal DDR) for fast CDO reads. Linux's spi_nor_suspend
++						 * set reg_proto=1-1-1 before suspend. On resume, Linux
++						 * sends register commands in 1-1-1 but the flash is in
++						 * 8D-8D-8D → mode mismatch → Write SR fails.
++						 * Toggle the OSPI controller's reset pin to put the flash
++						 * back to its power-on default (1-1-1).
++						 * Sequence matches XOspiPsv_DeviceResetViaOspi(). */
++						{
++							u32 OspiCfg;
++
++							OspiCfg = XPlmi_In32(0xF1010000U);
++							XPlmi_Out32(0xF1010000U, OspiCfg | 0x40U);
++
++							OspiCfg = XPlmi_In32(0xF1010000U);
++							XPlmi_Out32(0xF1010000U, OspiCfg & ~0x20U);
++							usleep(5U);
++
++							OspiCfg = XPlmi_In32(0xF1010000U);
++							XPlmi_Out32(0xF1010000U, OspiCfg | 0x20U);
++							usleep(150U);
++
++							OspiCfg = XPlmi_In32(0xF1010000U);
++							XPlmi_Out32(0xF1010000U, OspiCfg & ~0x20U);
++							usleep(1200U);
++						}
++					}
++				}
+ 			}
+-			/* Make sure subsystem owns the core before requesting wakeup */
++			xil_printf("[FPD] Powering Up Core 0x%x\r\n", DeviceId);
+ 			Status = XPmDevice_Request(SubsystemId, DeviceId,
+ 					     (u32)XPM_MAX_CAPABILITY,
+ 					     (u32)XPM_DEF_QOS,
+@@ -2355,6 +2443,7 @@ XStatus XPm_RequestWakeUp(u32 SubsystemId, const u32 DeviceId,
+ 				goto done;
+ 			}
+ 			Status = XPmCore_RequestWakeup(Core, SetAddress, Address);
++			xil_printf("[FPD] Core 0x%x wakeup rc=0x%x\r\n", DeviceId, Status);
+ 			if (XST_SUCCESS == Status) {
+ 				Status = SetSubsystemState_ByCore(Core, (u32)ONLINE);
+ 				if (XST_SUCCESS != Status) {
+diff --git a/lib/sw_services/xilpm_ng/src/xilpm_runtime/src/xpm_runtime_clock.c b/lib/sw_services/xilpm_ng/src/xilpm_runtime/src/xpm_runtime_clock.c
+index 725b651..e79ee48 100644
+--- a/lib/sw_services/xilpm_ng/src/xilpm_runtime/src/xpm_runtime_clock.c
++++ b/lib/sw_services/xilpm_ng/src/xilpm_runtime/src/xpm_runtime_clock.c
+@@ -184,6 +184,13 @@ static void XPmClock_ReleaseInt(XPm_ClockNode *Clk)
+ 	XStatus Status;
+ 
+ 	if (Clk != NULL) {
++		/* Add a guard check on Clock UseCount */
++		if (0U == Clk->UseCount) {
++			PmWarn("ReleaseInt: UseCount already 0 for 0x%x (%s), skipping\r\n",
++				Clk->Node.Id, Clk->Name);
++			return;
++		}
++
+ 		/* Decrease the use count of clock */
+ 		PmDecrementClk(Clk->Node.Id, Clk->Name, Clk->UseCount);
+ 

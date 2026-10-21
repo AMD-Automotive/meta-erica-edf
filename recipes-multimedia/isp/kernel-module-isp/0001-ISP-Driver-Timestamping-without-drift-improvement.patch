@@ -1,0 +1,86 @@
+From 88adc35c8f5a7d3f0246b0ac75ef9dac9a3015a2 Mon Sep 17 00:00:00 2001
+From: LT Thomas <lthomas@amd.com>
+Date: Tue, 23 Jun 2026 07:31:55 -0700
+Subject: [PATCH] ISP Driver Timestamping without drift improvement
+
+---
+ visp/visp_driver.c | 56 +++++++++++++++++-----------------------------
+ 1 file changed, 21 insertions(+), 35 deletions(-)
+
+diff --git a/visp/visp_driver.c b/visp/visp_driver.c
+index 166e2ec..0a6de64 100644
+--- a/visp/visp_driver.c
++++ b/visp/visp_driver.c
+@@ -112,18 +112,6 @@ MODULE_PARM_DESC(dump_dq_payload,
+ #define VISP_SOF_TS_HZ 100000000ULL
+ #define VISP_SOF_TS_NS_PER_TICK (NSEC_PER_SEC / VISP_SOF_TS_HZ)
+ 
+-/*
+- * RPU SOF -> CLOCK_MONOTONIC anchor, shared across every ISP instance and
+- * every /dev/videoX node. The RPU's free-running 100 MHz counter is a single
+- * global time source, so the offset that maps it into CLOCK_MONOTONIC is
+- * computed exactly once from the first frame seen on any node and then reused
+- * everywhere. This keeps all streams on one common, jitter-free time base
+- * instead of each node anchoring to a slightly different instant.
+- */
+-static DEFINE_SPINLOCK(visp_sof_sync_lock);
+-static bool visp_sof_sync_valid;
+-static s64 visp_sof_to_mono_off_ns;
+-
+ #define VISP_DEFAULT_SENSOR "ox03f10"
+ #define VISP_DEFAULT_SENSOR_MODE 0
+ #define VISP_DEFAULT_SENSOR_XML "/usr/share/limo_example_jsons/OX03f10.xml"
+@@ -914,32 +902,30 @@ static int handle_frameout_buffer(struct visp_dev *isp_dev)
+ 	 */
+ 	if (sof_ticks) {
+ 		u64 rpu_ns = sof_ticks * VISP_SOF_TS_NS_PER_TICK;
+-		s64 off;
+ 
+-		/*
+-		 * Anchor the RPU clock to CLOCK_MONOTONIC exactly once,
+-		 * driver-wide, and reuse that offset for every frame on every
+-		 * /dev/videoX so all streams share one common, jitter-free
+-		 * time base.
+-		 */
+-		if (smp_load_acquire(&visp_sof_sync_valid)) {
+-			off = READ_ONCE(visp_sof_to_mono_off_ns);
++		if (!now_ticks) {
++			/*
++			 * Older firmware that omits the RPU "current"
++			 * timestamp: we cannot measure the true APU<->RPU
++			 * offset, so approximate it by subtracting a fixed
++			 * 20 ms pipeline latency from the SOF time.
++			 */
++			ts_ns = rpu_ns - 20000000;
+ 		} else {
+-			u64 rpu_anchor_ns = now_ticks ?
+-				now_ticks * VISP_SOF_TS_NS_PER_TICK : rpu_ns;
+-			unsigned long flags;
+-
+-			spin_lock_irqsave(&visp_sof_sync_lock, flags);
+-			if (!visp_sof_sync_valid) {
+-				visp_sof_to_mono_off_ns =
+-					(s64)ts_ns - (s64)rpu_anchor_ns;
+-				/* publish the offset before marking it valid */
+-				smp_store_release(&visp_sof_sync_valid, true);
+-			}
+-			off = visp_sof_to_mono_off_ns;
+-			spin_unlock_irqrestore(&visp_sof_sync_lock, flags);
++			/*
++			 * Re-anchor the RPU clock to CLOCK_MONOTONIC on every
++			 * frame: pair the SOF tick with the RPU "current" tick
++			 * sampled in the same payload, and re-measure the
++			 * APU<->RPU offset against the local ktime_get_ns()
++			 * capture each time. This tracks any drift between the
++			 * two clock domains instead of freezing a one-shot
++			 * offset.
++			 */
++			u64 rpu_now_ns = now_ticks * VISP_SOF_TS_NS_PER_TICK;
++			s64 off = (s64)ts_ns - (s64)rpu_now_ns;
++
++			ts_ns = rpu_ns + off;
+ 		}
+-		ts_ns = rpu_ns + off;
+ 	}
+ 
+ 

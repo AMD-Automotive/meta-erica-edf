@@ -1,0 +1,513 @@
+From 5ef11bbb9bdbdecadd27be27ca3a79d94728b49e Mon Sep 17 00:00:00 2001
+From: LT Thomas <lthomas@amd.com>
+Date: Wed, 12 Aug 2026 20:19:10 -0700
+Subject: [PATCH] Start of Frame timestamp and sensor stop/start change
+
+---
+ visp/include/visp_common.h |  13 ++-
+ visp/visp_app.c            |  67 ++++++++++-
+ visp/visp_driver.c         | 229 ++++++++++++++++++++++++++++++++++---
+ visp/visp_driver.h         |  13 +++
+ 4 files changed, 301 insertions(+), 21 deletions(-)
+
+diff --git a/visp/include/visp_common.h b/visp/include/visp_common.h
+index 49adbf2..85958f7 100644
+--- a/visp/include/visp_common.h
++++ b/visp/include/visp_common.h
+@@ -56,6 +56,14 @@
+ #define __VISP_COMMON_H__
+ 
+ int visp_buf_done(struct v4l2_subdev *sd, void *arg);
++/*
++ * Same as visp_buf_done() but stamps the V4L2 buffer with the supplied
++ * hardware-side timestamp instead of taking ktime_get_ns() at the time of
++ * the call. Use this from the mailbox/frameout callback path so the V4L2
++ * timestamp reflects the sensor start-of-frame time, not the latency
++ * through the mailbox / scheduling that follows.
++ */
++int visp_buf_done_ts(struct v4l2_subdev *sd, void *arg, u64 ts_ns);
+ int visp_set_frame_interval_public(struct visp_dev *isp_dev,
+ 				   struct v4l2_subdev_frame_interval *fi);
+ int visp_set_fmt_public(struct visp_dev *isp_dev,
+@@ -88,7 +96,8 @@ int media_isp_device_sensor_open(struct visp_dev *isp_dev, uint8_t port);
+ int media_isp_device_camera_connect(struct visp_dev *isp_dev, uint8_t index);
+ 
+ int read_dq_buf_info(void *data, struct visp_dev *isp_dev, struct Chn_info *info,
+-		    uint8_t *buf_index, uint32_t *p_owner);
++		    uint8_t *buf_index, uint32_t *p_owner, u64 *timestamp_sof,
++		    u64 *timestamp_now);
+ int media_isp_device_dqbuf(struct visp_dev *isp_dev, struct Chn_info *info,
+ 			   media_buf *buf, void *packet_from_rpu,
+ 			   output_buffer_t *output_buffer);
+@@ -101,6 +110,8 @@ int media_isp_set_frame_rate(struct visp_dev *isp_dev, int pad,
+ 			     uint32_t *frame_rate);
+ int media_isp_hal_buf_done(struct v4l2_subdev *sd, int pad,
+ 			   const media_buf *buf);
++int media_isp_hal_buf_done_ts(struct v4l2_subdev *sd, int pad,
++			      const media_buf *buf, u64 ts_ns);
+ int isp_device_create(struct visp_dev *isp_dev, uint8_t port);
+ 
+ RESULT vsi_cam_device_awb_disable(struct visp_dev *isp_dev,
+diff --git a/visp/visp_app.c b/visp/visp_app.c
+index 868d56f..b9f4bfb 100644
+--- a/visp/visp_app.c
++++ b/visp/visp_app.c
+@@ -2308,9 +2308,10 @@ ERR_TO_RELEASE_CAMCOMMON:
+ }
+ 
+ int visp_buf_done(struct v4l2_subdev *sd, void *arg);
++int visp_buf_done_ts(struct v4l2_subdev *sd, void *arg, u64 ts_ns);
+ 
+-int media_isp_hal_buf_done(struct v4l2_subdev *sd, int pad,
+-			   const media_buf *buf)
++int media_isp_hal_buf_done_ts(struct v4l2_subdev *sd, int pad,
++			      const media_buf *buf, u64 ts_ns)
+ {
+ 	struct visp_dev *isp_dev = v4l2_get_subdevdata(sd);
+ 	struct visp_buf KernelBuf;
+@@ -2329,7 +2330,7 @@ int media_isp_hal_buf_done(struct v4l2_subdev *sd, int pad,
+ 	}
+ 	KernelBuf.pad = pad;
+ 
+-	ret_val = visp_buf_done(sd, &KernelBuf);
++	ret_val = visp_buf_done_ts(sd, &KernelBuf, ts_ns);
+ 	if (ret_val != 0) {
+ 		dev_dbg(isp_dev->dev, "Failed to signal BufDone\n");
+ 		return ret_val;
+@@ -2337,8 +2338,16 @@ int media_isp_hal_buf_done(struct v4l2_subdev *sd, int pad,
+ 	return VSI_SUCCESS;
+ }
+ 
++int media_isp_hal_buf_done(struct v4l2_subdev *sd, int pad,
++			   const media_buf *buf)
++{
++	/* ts_ns == 0 -> visp_buf_done_ts() falls back to ktime_get_ns(). */
++	return media_isp_hal_buf_done_ts(sd, pad, buf, 0);
++}
++
+ int read_dq_buf_info(void *data, struct visp_dev *isp_dev, struct Chn_info *info,
+-		    uint8_t *buf_index, uint32_t *p_owner)
++		    uint8_t *buf_index, uint32_t *p_owner, u64 *timestamp_sof,
++		    u64 *timestamp_now)
+ {
+ 	uint8_t *p_data = NULL;
+ 	uint32_t hw_id_t = 100;
+@@ -2347,6 +2356,11 @@ int read_dq_buf_info(void *data, struct visp_dev *isp_dev, struct Chn_info *info
+ 
+ 	payload_packet *packet = data;
+ 
++	if (timestamp_sof)
++		*timestamp_sof = 0;
++	if (timestamp_now)
++		*timestamp_now = 0;
++
+ 	if (!packet) {
+ 		dev_err(isp_dev->dev, "NO data in DQ Payload %s %d\n", __func__,
+ 			__LINE__);
+@@ -2406,6 +2420,51 @@ int read_dq_buf_info(void *data, struct visp_dev *isp_dev, struct Chn_info *info
+ 	 */
+ 	memcpy(p_owner, p_data, sizeof(uint32_t));
+ 
++	/*
++	 * The RPU firmware appends two 8-byte timestamps as the LAST 16 bytes
++	 * of the DISPLAY_BUFFER payload: the sensor start-of-frame timestamp
++	 * (timestamp_sof) immediately followed by the RPU "current" timestamp
++	 * sampled when the message was built. Both are free-running 100 MHz
++	 * ticks. They are read from the tail rather than a fixed post-p_owner
++	 * offset because the firmware header carries additional fixed fields
++	 * this parser does not decode.
++	 *
++	 * Verified via dump_dq_payload (payload_size = 69):
++	 *   [ 53-byte header ][ u64 timestamp_sof ][ u64 timestamp_now ]
++	 * SOF frame-to-frame delta measured ~3,333,024 ticks = 33.33 ms (30
++	 * fps), confirming both the layout and the 100 MHz clock.
++	 *
++	 * Firmware that does not append them sends a shorter payload, in which
++	 * case the out-params stay 0 and the caller falls back to
++	 * ktime_get_ns().
++	 */
++	if (timestamp_sof) {
++		/* Minimum header bytes this function decodes before the tail. */
++		const uint32_t min_header = sizeof(uint32_t)	   /* hw_id */
++					    + sizeof(struct Chn_info)
++					    + sizeof(uint32_t)	   /* skipped */
++					    + sizeof(uint8_t)	   /* buf_index */
++					    + sizeof(uint32_t);	   /* p_owner */
++		uint8_t *p_payload = packet->payload;
++		uint64_t val = 0;
++
++		if (packet->payload_size >= min_header + 2 * sizeof(uint64_t)) {
++			memcpy(&val,
++			       p_payload + packet->payload_size -
++				       2 * sizeof(uint64_t),
++			       sizeof(val));
++			*timestamp_sof = val;
++
++			if (timestamp_now) {
++				memcpy(&val,
++				       p_payload + packet->payload_size -
++					       sizeof(uint64_t),
++				       sizeof(val));
++				*timestamp_now = val;
++			}
++		}
++	}
++
+ 	return 0;
+ }
+ 
+diff --git a/visp/visp_driver.c b/visp/visp_driver.c
+index 06587d4..ee4c891 100644
+--- a/visp/visp_driver.c
++++ b/visp/visp_driver.c
+@@ -90,6 +90,32 @@
+ #include "visp_mbox_driver.h"
+ #include "oba.h"
+ 
++/*
++ * One-shot debugging aid: dump the RPU -> APU DISPLAY_BUFFER payload bytes
++ * so we can figure out where (if anywhere) the firmware places the
++ * pic_buf_metadata_info_t.timestamp_sof value. Set to N > 0 to dump the
++ * next N payloads, e.g.:
++ *   echo 3 > /sys/module/visp/parameters/dump_dq_payload
++ * Each successful dump decrements the counter; 0 disables.
++ */
++static int visp_dump_dq_payload;
++module_param_named(dump_dq_payload, visp_dump_dq_payload, int, 0644);
++MODULE_PARM_DESC(dump_dq_payload,
++		 "Dump the next N RPU DISPLAY_BUFFER payload hexdumps "
++		 "(then auto-clears). Use to reverse-engineer the payload "
++		 "layout (timestamp_sof offset etc). 0 = off.");
++
++/*
++ * The firmware's sensor start-of-frame timestamp (timestamp_sof, appended to
++ * the DISPLAY_BUFFER payload) is a free-running counter expressed in ticks of
++ * a 100 MHz clock, i.e. 10 ns per tick. Empirically verified against the
++ * 30 fps sensor cadence: one frame = ~3,333,133 ticks = 33.33 ms, and a
++ * 26-frame span measured 10.002 ns/tick. Adjust VISP_SOF_TS_HZ if a different
++ * platform clocks this counter at another rate.
++ */
++#define VISP_SOF_TS_HZ 100000000ULL
++#define VISP_SOF_TS_NS_PER_TICK (NSEC_PER_SEC / VISP_SOF_TS_HZ)
++
+ #define VISP_DEFAULT_SENSOR "ox03f10"
+ #define VISP_DEFAULT_SENSOR_MODE 0
+ 
+@@ -844,6 +870,13 @@ static int handle_frameout_buffer(struct visp_dev *isp_dev, int port, mbox_post_
+ 	uint8_t buf_index;
+ 	int pad = -1;
+ 	int ret_val = 0;
++	u64 sof_ticks = 0;
++	u64 now_ticks = 0;
++	/*
++	 * Fallback timestamp: captured as early as possible in case the
++	 * firmware does not provide a hardware start-of-frame timestamp.
++	 */
++	u64 ts_ns = ktime_get_ns();
+ 
+ 	/* Validate inputs */
+ 	if (!isp_dev) {
+@@ -869,7 +902,30 @@ static int handle_frameout_buffer(struct visp_dev *isp_dev, int port, mbox_post_
+ 	 * read_dq_buf_info() validates buf_index and reads p_owner from payload.
+ 	 */
+ 	uint32_t p_owner_val;
+-	ret_val = read_dq_buf_info(msg->payload, isp_dev, &info, &buf_index, &p_owner_val);
++
++	/*
++	 * One-shot payload hexdump (controlled by /sys/module/visp/parameters/
++	 * dump_dq_payload). Used to locate where the firmware places
++	 * pic_buf_metadata_info_t.timestamp_sof in the DISPLAY_BUFFER payload.
++	 *
++	 * Note: lock-free read/decrement -- this is debug only;
++	 */
++	if (READ_ONCE(visp_dump_dq_payload) > 0) {
++		size_t dump_len = min_t(size_t, msg->size, 256);
++
++		dev_info(isp_dev->dev,
++			 "visp_dq: dumping payload (size=%u, showing %zu bytes), "
++			 "pic_buf_metadata_info_t starts with u64 frame_count, "
++			 "u64 timestamp_sof, u64 timestamp_eof, ...\n",
++			 msg->size, dump_len);
++		print_hex_dump(KERN_INFO, "visp_dq: ", DUMP_PREFIX_OFFSET,
++			       16, 1, msg->payload, dump_len, true);
++		WRITE_ONCE(visp_dump_dq_payload,
++			   READ_ONCE(visp_dump_dq_payload) - 1);
++	}
++
++	ret_val = read_dq_buf_info(msg->payload, isp_dev, &info, &buf_index,
++				   &p_owner_val, &sof_ticks, &now_ticks);
+ 	if (ret_val) {
+ 		if (ret_val == -ESHUTDOWN) {
+ 			/* Stream already stopped: silently drop stale frameout buffer. */
+@@ -881,6 +937,42 @@ static int handle_frameout_buffer(struct visp_dev *isp_dev, int port, mbox_post_
+ 		goto error_free_buf;
+ 	}
+ 
++	/*
++	 * Prefer the sensor start-of-frame timestamp from the firmware: it
++	 * reflects the steady capture cadence, immune to the mailbox / daemon
++	 * delivery jitter that ktime_get_ns() would otherwise pick up. The
++	 * firmware reports it in 100 MHz ticks, so scale to nanoseconds. Fall
++	 * back to the early ktime_get_ns() capture when the firmware does not
++	 * provide it (sof_ticks == 0).
++	 */
++	if (sof_ticks) {
++		u64 rpu_ns = sof_ticks * VISP_SOF_TS_NS_PER_TICK;
++
++		if (!now_ticks) {
++			/*
++			 * Older firmware that omits the RPU "current"
++			 * timestamp: we cannot measure the true APU<->RPU
++			 * offset, so approximate it by subtracting a fixed
++			 * 20 ms pipeline latency from the SOF time.
++			 */
++			ts_ns = rpu_ns - 20000000;
++		} else {
++			/*
++			 * Re-anchor the RPU clock to CLOCK_MONOTONIC on every
++			 * frame: pair the SOF tick with the RPU "current" tick
++			 * sampled in the same payload, and re-measure the
++			 * APU<->RPU offset against the local ktime_get_ns()
++			 * capture each time. This tracks any drift between the
++			 * two clock domains instead of freezing a one-shot
++			 * offset.
++			 */
++			u64 rpu_now_ns = now_ticks * VISP_SOF_TS_NS_PER_TICK;
++			s64 off = (s64)ts_ns - (s64)rpu_now_ns;
++
++			ts_ns = rpu_ns + off;
++		}
++	}
++
+ 	/* Lock to read cam_device_bufs and write p_owner atomically.
+ 	 * Without lock, destroy_buf_pool could free the buffer between
+ 	 * pointer read and p_owner write, causing use-after-free.
+@@ -917,10 +1009,11 @@ static int handle_frameout_buffer(struct visp_dev *isp_dev, int port, mbox_post_
+ 	}
+ 
+ 	/* Mark buffer as done*/
+-	ret_val = media_isp_hal_buf_done(&isp_dev->sd, pad,
+-					 &(isp_dev->isp_ports[info.vt_id]
+-					 .isp_chns[info.path]
+-					 .bufs[output_buffer->index]));
++	ret_val = media_isp_hal_buf_done_ts(&isp_dev->sd, pad,
++					    &(isp_dev->isp_ports[info.vt_id]
++					    .isp_chns[info.path]
++					    .bufs[output_buffer->index]),
++					    ts_ns);
+ 	if (ret_val != 0) {
+ 		dev_dbg(isp_dev->dev,
+ 			"%s: MediaIspHalBufDone failed with error %d\n",
+@@ -1733,6 +1826,7 @@ static int visp_pad_s_stream(struct v4l2_subdev *sd, void *arg)
+ 	int ret = 0;
+ 	bool upstream_started = false;
+ 	bool was_streaming = false;
++	bool first_streamon_for_port = false;
+ 
+ 	if (pad_stream->pad >= VISP_PAD_NR)
+ 		return -EINVAL;
+@@ -1757,8 +1851,16 @@ static int visp_pad_s_stream(struct v4l2_subdev *sd, void *arg)
+ 		 * subdev_streamon_count[port] tracks active output paths on this port.
+ 		 * Start the shared upstream pipeline only for the first active path,
+ 		 * regardless of whether that path is MP, SP1, SP2 or RAW.
++		 *
++		 * With the keep-alive pin held (taken below) this count never falls
++		 * back to 0 after the first stream-on, so first_streamon_for_port is
++		 * true only for the very first stream-on of the port's lifetime.  On
++		 * every later (quick-restart) stream-on the pipeline, sensor frame
++		 * rate and channel format are already programmed in the RPU, so we
++		 * skip re-issuing them and only send the RPU stream-on.
+ 		 */
+-		if (ext->subdev_streamon_count[port] == 0) {
++		first_streamon_for_port = (ext->subdev_streamon_count[port] == 0);
++		if (first_streamon_for_port) {
+ 			ret = visp_stream_pipeline_subdevs(isp_dev, port, 1);
+ 			if (ret) {
+ 				dev_err(isp_dev->dev,
+@@ -1777,14 +1879,18 @@ static int visp_pad_s_stream(struct v4l2_subdev *sd, void *arg)
+ 				ret = -EINVAL;
+ 				goto ERR_TO_RPU_LOCK;
+ 			}
+-		}
+ 
+-		ret = media_isp_device_set_format(isp_dev, port, chn);
+-		if (ret != 0) {
+-			dev_err(isp_dev->dev, "%s isp_id : %d FAILED SetFormat\n",
+-				__func__, isp_dev->id);
+-			ret = -EINVAL;
+-			goto ERR_TO_RPU_LOCK;
++			ret = media_isp_device_set_format(isp_dev, port, chn);
++			if (ret != 0) {
++				dev_err(isp_dev->dev, "%s isp_id : %d FAILED SetFormat\n",
++					__func__, isp_dev->id);
++				ret = -EINVAL;
++				goto ERR_TO_RPU_LOCK;
++			}
++		} else {
++			dev_dbg(isp_dev->dev,
++				"Keep-alive replay on isp:%d port %d chn %d -- skipping set_frame_rate/set_format\n",
++				isp_dev->id, port, chn);
+ 		}
+ 
+ 		ret = media_isp_device_stream_on(isp_dev, port, chn);
+@@ -1795,6 +1901,23 @@ static int visp_pad_s_stream(struct v4l2_subdev *sd, void *arg)
+ 			goto ERR_TO_RPU_LOCK;
+ 		}
+ 		ext->subdev_streamon_count[port]++;
++
++		/*
++		 * Keep-alive pin: on the first successful stream-on for this port,
++		 * take one extra reference on subdev_streamon_count[port] that is
++		 * only released at module-remove time.  This keeps the sensor
++		 * pipeline + RPU camera connection + cam_device buffer pool alive
++		 * across client stream-off/close, so media_isp_stream_off() sees a
++		 * non-zero refcount and skips camera-disconnect / pipeline-destroy,
++		 * and a later stream-on only re-issues the RPU stream-on.
++		 */
++		if (first_streamon_for_port && !ext->keep_alive_ref_held[port]) {
++			ext->subdev_streamon_count[port]++;
++			ext->keep_alive_ref_held[port] = true;
++			dev_info(isp_dev->dev,
++				 "Keep-alive pin acquired for port %d (sensor/RPU stay live across client disconnects)\n",
++				 port);
++		}
+ 		/* EXIT PORT Level CRITICAL SECTION */
+ 	} else {
+ 		was_streaming = isp_dev->streamon[pad_stream->pad];
+@@ -1861,7 +1984,7 @@ ERR_TO_RPU_LOCK:
+ 	return ret;
+ }
+ 
+-int visp_buf_done(struct v4l2_subdev *sd, void *arg)
++int visp_buf_done_ts(struct v4l2_subdev *sd, void *arg, u64 ts_ns)
+ {
+ 	struct visp_buf ubuf;
+ 	struct visp_pad_data *cur_pad;
+@@ -1921,8 +2044,16 @@ int visp_buf_done(struct v4l2_subdev *sd, void *arg)
+ 		video = media_entity_to_video_device(pad->entity);
+ 		if (buf->sequence < video->queue->max_num_buffers) {
+ 			if (buf->vb.vb2_buf.state == VB2_BUF_STATE_ACTIVE) {
+-				/* Set timestamp and sequence before marking done */
+-				buf->vb.vb2_buf.timestamp = ktime_get_ns();
++				/*
++				 * Use the hardware start-of-frame timestamp
++				 * captured at the mbox/frameout callback when
++				 * available; fall back to a fresh ktime_get_ns()
++				 * for callers that don't have one (legacy ioctl
++				 * path). Queue is configured with
++				 * V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC.
++				 */
++				buf->vb.vb2_buf.timestamp =
++					ts_ns ? ts_ns : ktime_get_ns();
+ 
+ 				spin_lock_irqsave(&cur_pad->qlock, flags);
+ 				buf->vb.sequence = cur_pad->sequence++;
+@@ -1937,6 +2068,12 @@ int visp_buf_done(struct v4l2_subdev *sd, void *arg)
+ 	return 0;
+ }
+ 
++int visp_buf_done(struct v4l2_subdev *sd, void *arg)
++{
++	/* ts_ns == 0 means "stamp now" -- see visp_buf_done_ts(). */
++	return visp_buf_done_ts(sd, arg, 0);
++}
++
+ #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 18, 0)
+ static int visp_queryctrl(struct v4l2_subdev *sd, void *arg)
+ {
+@@ -3936,11 +4073,71 @@ err_async_notifier:
+ 	return ret;
+ }
+ 
++static void visp_release_keep_alive_pins(struct visp_dev *isp_dev)
++{
++	struct visp_limo_isp_dev_extended *ext;
++	int port;
++
++	if (!isp_dev || !isp_dev->extended_struct)
++		return;
++
++	ext = ISP_DEV_EXTENDED(isp_dev);
++
++	/*
++	 * Release the per-port keep-alive references taken in
++	 * visp_pad_s_stream() and perform the real upstream teardown
++	 * (RPU camera disconnect, pipeline destroy, sensor s_stream(0))
++	 * that stream-off deferred while the pin was held.
++	 *
++	 * By the time visp_remove() runs every video node is closed, so all
++	 * streamon[] flags are 0.  Dropping each pin takes subdev_streamon_count
++	 * back to 0, letting media_isp_stream_off() run the camera-disconnect /
++	 * pipeline-destroy path it skipped on every client stream-off.
++	 */
++	for (port = 0; port < MEDIA_ISP_PORT_MAX; port++) {
++		if (!ext->keep_alive_ref_held[port])
++			continue;
++
++		mutex_lock(&isp_dev->port_lock[port]);
++
++		ext->keep_alive_ref_held[port] = false;
++		if (ext->subdev_streamon_count[port])
++			ext->subdev_streamon_count[port]--;
++
++		if (ext->subdev_streamon_count[port] == 0) {
++			int ret;
++
++			/*
++			 * media_isp_stream_off() disconnects the RPU camera and
++			 * destroys the pipeline/buffer pool once the port
++			 * refcount hits 0 (streamon[] is already 0, so it skips
++			 * the RPU stream-off itself).
++			 */
++			media_isp_stream_off(isp_dev, port, 0);
++
++			ret = visp_stream_pipeline_subdevs(isp_dev, port, 0);
++			if (ret)
++				dev_warn(isp_dev->dev,
++					 "Keep-alive teardown: pipeline stop failed on port %d: %d\n",
++					 port, ret);
++			else
++				dev_info(isp_dev->dev,
++					 "Keep-alive pin released and pipeline stopped on port %d\n",
++					 port);
++		}
++
++		mutex_unlock(&isp_dev->port_lock[port]);
++	}
++}
++
+ static void visp_remove(struct platform_device *pdev)
+ {
+ 	struct visp_dev *isp_dev;
+ 
+ 	isp_dev = platform_get_drvdata(pdev);
++
++	visp_release_keep_alive_pins(isp_dev);
++
+ 	visp_release_upstream_nodes_dt(isp_dev);
+ 
+ 	/* Unregister from the module-wide list */
+diff --git a/visp/visp_driver.h b/visp/visp_driver.h
+index cc30008..2ddccc6 100644
+--- a/visp/visp_driver.h
++++ b/visp/visp_driver.h
+@@ -238,6 +238,19 @@ enum isp_mode {
+ struct visp_limo_isp_dev_extended {
+ 	int id;
+ 	int subdev_streamon_count[VISP_PORT_PAD_NR];
++	/*
++	 * Keep-alive (quick sensor stop/start): on the first stream-on for a
++	 * given port we take one extra, never-auto-released reference on
++	 * subdev_streamon_count[port] so it can never fall back to 0 during
++	 * normal open/close cycles of the /dev/videoN nodes.  This keeps the
++	 * upstream sensor pipeline + RPU camera connection + cam_device buffer
++	 * pool (and the previously programmed frame rate/format) alive across
++	 * client disconnects.  A stream-off then only issues the RPU
++	 * stream-off (stops the sensor) instead of tearing everything down, and
++	 * a subsequent stream-on just re-issues the RPU stream-on.  The pin is
++	 * released only at module-remove time by visp_release_keep_alive_pins().
++	 */
++	bool keep_alive_ref_held[MEDIA_ISP_PORT_MAX];
+ 	struct device_node *upstream_nodes[VISP_PORT_NR][VISP_MAX_UPSTREAM_NODES];
+ 	u32 upstream_node_count[VISP_PORT_NR];
+ 	/*

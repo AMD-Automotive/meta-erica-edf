@@ -1,0 +1,45 @@
+#!/bin/sh
+# Copyright © Advanced Micro Devices, Inc., or its affiliates. All rights reserved.
+# SPDX-License-Identifier: MIT
+# Contributors: KC
+# Maintainer: KC
+
+# PID-1 init wrapper for the rave2-recovery image.
+#
+# Kernel cmdline points rdinit=/usr/sbin/recovery-init, bypassing systemd
+# entirely. The kernel panics if PID 1 ever exits, so this script must
+# never return.
+
+set +e
+
+# Default PATH (systemd would normally provide one). The programmer shells
+# out to flash_erase / flash_eraseall / flashcp / dd from mtd-utils + util-linux.
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+mount -t proc     -o nosuid,nodev,noexec proc /proc      2>/dev/null
+mount -t sysfs    -o nosuid,nodev,noexec sysfs /sys      2>/dev/null
+# CONFIG_DEVTMPFS_MOUNT may have already mounted /dev; ignore EBUSY.
+mount -t devtmpfs -o nosuid,mode=0755    devtmpfs /dev   2>/dev/null
+mkdir -p /dev/pts /dev/shm /run /tmp
+mount -t devpts   -o nosuid,noexec,gid=5,mode=620 devpts /dev/pts 2>/dev/null
+mount -t tmpfs    -o nosuid,nodev        tmpfs /run       2>/dev/null
+mount -t tmpfs    -o nosuid,nodev        tmpfs /tmp       2>/dev/null
+
+# Set hostname from /etc/hostname if present (cosmetic only).
+if [ -r /etc/hostname ]; then
+    hostname "$(cat /etc/hostname)" 2>/dev/null || true
+fi
+
+PROGRAMMER=/usr/sbin/programmer
+
+while true; do
+    if [ -x "${PROGRAMMER}" ]; then
+        echo "recovery-init: launching ${PROGRAMMER}" > /dev/kmsg 2>/dev/null
+        "${PROGRAMMER}"
+        rc=$?
+        echo "recovery-init: programmer exited rc=${rc}; restarting in 5s" > /dev/kmsg 2>/dev/null
+    else
+        echo "recovery-init: ${PROGRAMMER} not found or not executable" > /dev/kmsg 2>/dev/null
+    fi
+    sleep 5
+done

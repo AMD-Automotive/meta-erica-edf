@@ -1,0 +1,7 @@
+SPDX-FileCopyrightText: Copyright © Advanced Micro Devices, Inc., or its affiliates. All rights reserved.
+SPDX-FileContributor: JC
+# Maintainer: LT
+# Provenance: AMD-authored modification to the Xilinx Versal2 ISP kernel module
+# Owning recipe license: GPL-2.0-only
+
+SPDX-License-Identifier: GPL-2.0-only

@@ -1,0 +1,32 @@
+# Copyright © Advanced Micro Devices, Inc., or its affiliates. All rights reserved.
+# SPDX-License-Identifier: MIT
+# Contributors: BW
+# Maintainer: BW
+
+[Unit]
+Description=MDB5 PCIe FLR completion acknowledge
+# The PCIe host can assert an FLR at any time once the link is up, including
+# well before this SoC finishes booting. Start as early as a /dev/mem-using
+# service can, so the window in which an FLR would hang unacknowledged is as
+# small as possible. The daemon also reports and clears any FLR already
+# pending when it starts, so a function stranded during that window is
+# recovered rather than left dead until the next power cycle.
+DefaultDependencies=no
+After=sysinit.target
+Before=multi-user.target
+Conflicts=shutdown.target
+Before=shutdown.target
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/mdb5-flr-ack --controller 0 --pfs 0,1,2,3
+Restart=always
+RestartSec=1
+# Needs raw /dev/mem to reach MMI_PCIE_CTRL_SLCR, which rules out most of the
+# usual sandboxing. NoNewPrivileges is still safe and worth keeping.
+NoNewPrivileges=yes
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

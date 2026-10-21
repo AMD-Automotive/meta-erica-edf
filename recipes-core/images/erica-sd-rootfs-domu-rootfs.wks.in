@@ -1,0 +1,8 @@
+# Copyright © Advanced Micro Devices, Inc., or its affiliates. All rights reserved.
+# SPDX-License-Identifier: MIT
+# Contributors: KC
+# Maintainer: KC
+
+part  /boot  --source rootfs --change-directory=boot  --fixed-size=512M  --fstype=vfat  --use-label  --label dom0boot  --active  --align 4 
+part  /      --source rootfs --exclude-path=boot/                        --fstype=ext4  --use-label  --label root            --align 4 
+@GUEST_PARTITIONS@

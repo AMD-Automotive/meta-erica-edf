@@ -1,0 +1,20 @@
+# Copyright © Advanced Micro Devices, Inc., or its affiliates. All rights reserved.
+# SPDX-License-Identifier: MIT
+# Contributors: TO
+# Maintainer: TO
+
+[Unit]
+Description=Boot script for misc init tasks
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/usr/bin/autostart-dc.sh
+# Gracefully kills only the specific tmux session on stop
+ExecStop=/usr/bin/tmux kill-session -t ep_proxy
+RemainAfterExit=yes
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target

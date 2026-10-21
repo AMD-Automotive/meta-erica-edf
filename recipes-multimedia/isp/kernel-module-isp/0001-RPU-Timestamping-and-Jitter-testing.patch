@@ -1,0 +1,587 @@
+From cab52a710360d796c34383e839c7a6d94b9d9dd0 Mon Sep 17 00:00:00 2001
+From: LT Thomas <lthomas@amd.com>
+Date: Wed, 17 Jun 2026 06:15:11 -0700
+Subject: [PATCH] RPU Timestamping and Jitter testing
+
+---
+ dummy_sensor/dummy_sensor_drv.c  |   0
+ visp/include/visp_common.h       |  12 ++-
+ visp/visp_app.c                  |  55 ++++++++++-
+ visp/visp_driver.c               | 152 +++++++++++++++++++++++++++++--
+ visp/visp_driver.h               |   8 ++
+ visp/visp_event.c                |  75 +++++++++++++--
+ visp/visp_event.h                |   9 ++
+ visp_mbox/visp_mbox_driver.c     |  27 ++++--
+ visp_video/visp_video_register.h |   0
+ 9 files changed, 310 insertions(+), 28 deletions(-)
+ mode change 100755 => 100644 dummy_sensor/dummy_sensor_drv.c
+ mode change 100755 => 100644 visp_video/visp_video_register.h
+
+diff --git a/dummy_sensor/dummy_sensor_drv.c b/dummy_sensor/dummy_sensor_drv.c
+old mode 100755
+new mode 100644
+diff --git a/visp/include/visp_common.h b/visp/include/visp_common.h
+index c44376b..3c2b31b 100644
+--- a/visp/include/visp_common.h
++++ b/visp/include/visp_common.h
+@@ -56,6 +56,14 @@
+ #define __VISP_COMMON_H__
+ 
+ int visp_buf_done(struct v4l2_subdev *sd, void *arg);
++/*
++ * Same as visp_buf_done() but stamps the V4L2 buffer with the supplied
++ * hardware-side timestamp instead of taking ktime_get_ns() at the time of
++ * the call. Use this from the mailbox/frameout callback path so the V4L2
++ * timestamp reflects when the frame-done message landed on the APU, not
++ * the latency through kfifo / kzalloc / scheduling that follows.
++ */
++int visp_buf_done_ts(struct v4l2_subdev *sd, void *arg, u64 ts_ns);
+ int visp_set_frame_interval_public(struct visp_dev *isp_dev,
+ 				   struct v4l2_subdev_frame_interval *fi);
+ int visp_set_fmt_public(struct visp_dev *isp_dev,
+@@ -85,7 +93,7 @@ int media_isp_device_sensor_open(struct visp_dev *isp_dev, uint8_t port);
+ int media_isp_device_camera_connect(struct visp_dev *isp_dev, uint8_t index);
+ 
+ int read_dq_buf_info(void *data, struct visp_dev *isp_dev, struct Chn_info *info,
+-		    uint8_t *buf_index);
++		    uint8_t *buf_index, u64 *timestamp_sof, u64 *timestamp_now);
+ int media_isp_device_dqbuf(struct visp_dev *isp_dev, struct Chn_info *info,
+ 			   media_buf *buf, void *packet_from_rpu,
+ 			   output_buffer_t *output_buffer);
+@@ -98,6 +106,8 @@ int media_isp_set_frame_rate(struct visp_dev *isp_dev, int pad,
+ 			     uint32_t *frame_rate);
+ int media_isp_hal_buf_done(struct v4l2_subdev *sd, int pad,
+ 			   const media_buf *buf);
++int media_isp_hal_buf_done_ts(struct v4l2_subdev *sd, int pad,
++			      const media_buf *buf, u64 ts_ns);
+ int isp_device_create(struct visp_dev *isp_dev, uint8_t port);
+ 
+ RESULT vsi_cam_device_awb_disable(struct visp_dev *isp_dev,
+diff --git a/visp/visp_app.c b/visp/visp_app.c
+index 9eb2e8b..d37e20b 100644
+--- a/visp/visp_app.c
++++ b/visp/visp_app.c
+@@ -1654,9 +1654,10 @@ ERR_TO_RELEASE_CAMCOMMON:
+ }
+ 
+ int visp_buf_done(struct v4l2_subdev *sd, void *arg);
++int visp_buf_done_ts(struct v4l2_subdev *sd, void *arg, u64 ts_ns);
+ 
+-int media_isp_hal_buf_done(struct v4l2_subdev *sd, int pad,
+-			   const media_buf *buf)
++int media_isp_hal_buf_done_ts(struct v4l2_subdev *sd, int pad,
++			      const media_buf *buf, u64 ts_ns)
+ {
+ 	struct visp_dev *isp_dev = v4l2_get_subdevdata(sd);
+ 	struct visp_buf KernelBuf;
+@@ -1675,7 +1676,7 @@ int media_isp_hal_buf_done(struct v4l2_subdev *sd, int pad,
+ 	}
+ 	KernelBuf.pad = pad;
+ 
+-	ret_val = visp_buf_done(sd, &KernelBuf);
++	ret_val = visp_buf_done_ts(sd, &KernelBuf, ts_ns);
+ 	if (ret_val != 0) {
+ 		dev_dbg(isp_dev->dev, "Failed to signal BufDone\n");
+ 		return ret_val;
+@@ -1683,8 +1684,15 @@ int media_isp_hal_buf_done(struct v4l2_subdev *sd, int pad,
+ 	return VSI_SUCCESS;
+ }
+ 
++int media_isp_hal_buf_done(struct v4l2_subdev *sd, int pad,
++			   const media_buf *buf)
++{
++	/* ts_ns == 0 -> visp_buf_done_ts() falls back to ktime_get_ns(). */
++	return media_isp_hal_buf_done_ts(sd, pad, buf, 0);
++}
++
+ int read_dq_buf_info(void *data, struct visp_dev *isp_dev, struct Chn_info *info,
+-		    uint8_t *buf_index)
++		    uint8_t *buf_index, u64 *timestamp_sof, u64 *timestamp_now)
+ {
+ 	uint8_t *p_data = NULL;
+ 	uint32_t hw_id_t = 100;
+@@ -1692,6 +1700,11 @@ int read_dq_buf_info(void *data, struct visp_dev *isp_dev, struct Chn_info *info
+ 
+ 	payload_packet *packet = data;
+ 
++	if (timestamp_sof)
++		*timestamp_sof = 0;
++	if (timestamp_now)
++		*timestamp_now = 0;
++
+ 	if (!packet) {
+ 		dev_err(isp_dev->dev, "NO data in DQ Payload %s %d\n", __func__,
+ 			__LINE__);
+@@ -1718,6 +1731,40 @@ int read_dq_buf_info(void *data, struct visp_dev *isp_dev, struct Chn_info *info
+ 	output_buffer = isp_chns->cam_device_bufs[*buf_index];
+ 
+ 	memcpy(&(output_buffer->p_owner), p_data, sizeof(uint32_t));
++	p_data += sizeof(uint32_t);
++
++	/*
++	 * The RPU firmware appends the sensor start-of-frame timestamp
++	 * (pic_buf_metadata_info_t.timestamp_sof, 8 bytes) after p_owner,
++	 * optionally followed by the RPU's "current" timestamp (8 bytes)
++	 * sampled when this message was built. Both are RPU 100 MHz ticks.
++	 * Only consume each when payload_size advertises the extra bytes, so
++	 * this parser stays compatible with firmware that sends fewer (or
++	 * none) -- in which case the unread out-params stay 0 and the caller
++	 * falls back to ktime_get_ns().
++	 */
++	if (timestamp_sof) {
++		const uint32_t consumed = sizeof(uint32_t)	   /* hw_id */
++					  + sizeof(struct Chn_info)
++					  + sizeof(uint32_t)	   /* skipped */
++					  + sizeof(uint8_t)	   /* buf_index */
++					  + sizeof(uint32_t);	   /* p_owner */
++		uint64_t val = 0;
++
++		if (packet->payload_size >= consumed + sizeof(uint64_t)) {
++			memcpy(&val, p_data, sizeof(val));
++			*timestamp_sof = val;
++			p_data += sizeof(uint64_t);
++
++			if (timestamp_now &&
++			    packet->payload_size >=
++				    consumed + 2 * sizeof(uint64_t)) {
++				memcpy(&val, p_data, sizeof(val));
++				*timestamp_now = val;
++			}
++		}
++	}
++
+ 	return 0;
+ }
+ 
+diff --git a/visp/visp_driver.c b/visp/visp_driver.c
+index 80ba56b..166e2ec 100644
+--- a/visp/visp_driver.c
++++ b/visp/visp_driver.c
+@@ -86,6 +86,44 @@
+ #include "visp_common.h"
+ #include "visp_mbox_driver.h"
+ 
++/*
++ * One-shot debugging aid: dump the RPU -> APU DISPLAY_BUFFER payload bytes
++ * so we can figure out where (if anywhere) the firmware places the
++ * pic_buf_metadata_info_t.timestamp_sof value. Set to N > 0 to dump the
++ * next N payloads, e.g.:
++ *   echo 3 > /sys/module/visp/parameters/dump_dq_payload
++ * Each successful dump decrements the counter; 0 disables.
++ */
++static int visp_dump_dq_payload;
++module_param_named(dump_dq_payload, visp_dump_dq_payload, int, 0644);
++MODULE_PARM_DESC(dump_dq_payload,
++		 "Dump the next N RPU DISPLAY_BUFFER payload hexdumps "
++		 "(then auto-clears). Use to reverse-engineer the payload "
++		 "layout (timestamp_sof offset etc). 0 = off.");
++
++/*
++ * The firmware's sensor start-of-frame timestamp (timestamp_sof, appended to
++ * the DISPLAY_BUFFER payload) is a free-running counter expressed in ticks of
++ * a 100 MHz clock, i.e. 10 ns per tick. Empirically verified against the
++ * 30 fps sensor cadence: one frame = ~3,333,133 ticks = 33.33 ms, and a
++ * 26-frame span measured 10.002 ns/tick. Adjust VISP_SOF_TS_HZ if a different
++ * platform clocks this counter at another rate.
++ */
++#define VISP_SOF_TS_HZ 100000000ULL
++#define VISP_SOF_TS_NS_PER_TICK (NSEC_PER_SEC / VISP_SOF_TS_HZ)
++
++/*
++ * RPU SOF -> CLOCK_MONOTONIC anchor, shared across every ISP instance and
++ * every /dev/videoX node. The RPU's free-running 100 MHz counter is a single
++ * global time source, so the offset that maps it into CLOCK_MONOTONIC is
++ * computed exactly once from the first frame seen on any node and then reused
++ * everywhere. This keeps all streams on one common, jitter-free time base
++ * instead of each node anchoring to a slightly different instant.
++ */
++static DEFINE_SPINLOCK(visp_sof_sync_lock);
++static bool visp_sof_sync_valid;
++static s64 visp_sof_to_mono_off_ns;
++
+ #define VISP_DEFAULT_SENSOR "ox03f10"
+ #define VISP_DEFAULT_SENSOR_MODE 0
+ #define VISP_DEFAULT_SENSOR_XML "/usr/share/limo_example_jsons/OX03f10.xml"
+@@ -805,6 +843,13 @@ static int handle_frameout_buffer(struct visp_dev *isp_dev)
+ 	uint8_t buf_index;
+ 	int pad = -1;
+ 	int ret_val = 0;
++	u64 sof_ticks = 0;
++	u64 now_ticks = 0;
++	/*
++	 * Fallback timestamp: captured as early as possible in case the
++	 * firmware does not provide a hardware start-of-frame timestamp.
++	 */
++	u64 ts_ns = ktime_get_ns();
+ 
+ 	/* Validate inputs */
+ 	if (!isp_dev) {
+@@ -833,8 +878,70 @@ static int handle_frameout_buffer(struct visp_dev *isp_dev)
+ 
+ 	memcpy(packet_from_rpu, msg->payload, size);
+ 
++	/*
++	 * One-shot payload hexdump (controlled by /sys/module/visp/parameters/
++	 * dump_dq_payload). Used to locate where the firmware places
++	 * pic_buf_metadata_info_t.timestamp_sof in the DISPLAY_BUFFER
++	 * payload, since the current parser does not extract it.
++	 *
++	 * Note: lock-free read/decrement -- this is debug only;
++	 */
++	if (READ_ONCE(visp_dump_dq_payload) > 0) {
++		size_t dump_len = min_t(size_t, size, 256);
++
++		dev_info(isp_dev->dev,
++			 "visp_dq: dumping payload (size=%zu, showing %zu bytes), "
++			 "pic_buf_metadata_info_t starts with u64 frame_count, "
++			 "u64 timestamp_sof, u64 timestamp_eof, ...\n",
++			 size, dump_len);
++		print_hex_dump(KERN_INFO, "visp_dq: ", DUMP_PREFIX_OFFSET,
++			       16, 1, packet_from_rpu, dump_len, true);
++		WRITE_ONCE(visp_dump_dq_payload,
++			   READ_ONCE(visp_dump_dq_payload) - 1);
++	}
++
+ 	/* Dequeue buffer from the ISP device*/
+-	read_dq_buf_info(packet_from_rpu, isp_dev, &info, &buf_index);
++	read_dq_buf_info(packet_from_rpu, isp_dev, &info, &buf_index, &sof_ticks,
++			 &now_ticks);
++
++	/*
++	 * Prefer the sensor start-of-frame timestamp from the firmware: it
++	 * reflects the steady capture cadence, immune to the kfifo / daemon
++	 * delivery jitter that ktime_get_ns() would otherwise pick up. The
++	 * firmware reports it in 100 MHz ticks, so scale to nanoseconds. Fall
++	 * back to the early ktime_get_ns() capture when the firmware does not
++	 * provide it (sof_ticks == 0).
++	 */
++	if (sof_ticks) {
++		u64 rpu_ns = sof_ticks * VISP_SOF_TS_NS_PER_TICK;
++		s64 off;
++
++		/*
++		 * Anchor the RPU clock to CLOCK_MONOTONIC exactly once,
++		 * driver-wide, and reuse that offset for every frame on every
++		 * /dev/videoX so all streams share one common, jitter-free
++		 * time base.
++		 */
++		if (smp_load_acquire(&visp_sof_sync_valid)) {
++			off = READ_ONCE(visp_sof_to_mono_off_ns);
++		} else {
++			u64 rpu_anchor_ns = now_ticks ?
++				now_ticks * VISP_SOF_TS_NS_PER_TICK : rpu_ns;
++			unsigned long flags;
++
++			spin_lock_irqsave(&visp_sof_sync_lock, flags);
++			if (!visp_sof_sync_valid) {
++				visp_sof_to_mono_off_ns =
++					(s64)ts_ns - (s64)rpu_anchor_ns;
++				/* publish the offset before marking it valid */
++				smp_store_release(&visp_sof_sync_valid, true);
++			}
++			off = visp_sof_to_mono_off_ns;
++			spin_unlock_irqrestore(&visp_sof_sync_lock, flags);
++		}
++		ts_ns = rpu_ns + off;
++	}
++
+ 
+ 	output_buffer = isp_dev->isp_ports[info.vt_id]
+ 			    .isp_chns[info.path]
+@@ -855,10 +962,11 @@ static int handle_frameout_buffer(struct visp_dev *isp_dev)
+ 	}
+ 
+ 	/* Mark buffer as done*/
+-	ret_val = media_isp_hal_buf_done(&isp_dev->sd, pad,
+-					 &(isp_dev->isp_ports[info.vt_id]
+-					 .isp_chns[info.path]
+-					 .bufs[output_buffer->index]));
++	ret_val = media_isp_hal_buf_done_ts(&isp_dev->sd, pad,
++					    &(isp_dev->isp_ports[info.vt_id]
++					    .isp_chns[info.path]
++					    .bufs[output_buffer->index]),
++					    ts_ns);
+ 	if (ret_val != 0) {
+ 		dev_dbg(isp_dev->dev,
+ 			"handle_frameout_buffer: MediaIspHalBufDone failed "
+@@ -1288,7 +1396,7 @@ ERR_TO_RPU_LOCK:
+ 	return ret;
+ }
+ 
+-int visp_buf_done(struct v4l2_subdev *sd, void *arg)
++int visp_buf_done_ts(struct v4l2_subdev *sd, void *arg, u64 ts_ns)
+ {
+ 	struct visp_buf ubuf;
+ 	struct visp_pad_data *cur_pad;
+@@ -1332,6 +1440,18 @@ int visp_buf_done(struct v4l2_subdev *sd, void *arg)
+ 		video = media_entity_to_video_device(pad->entity);
+ 		if (buf->sequence < video->queue->max_num_buffers) {
+ 			if (buf->vb.vb2_buf.state == VB2_BUF_STATE_ACTIVE) {
++				/*
++				 * Use the timestamp captured at the mbox/
++				 * frameout callback when available; fall back
++				 * to a fresh ktime_get_ns() for callers that
++				 * don't have one (legacy ioctl path).
++				 * Queue is configured with
++				 * V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC.
++				 */
++				buf->vb.vb2_buf.timestamp =
++					ts_ns ? ts_ns : ktime_get_ns();
++				buf->vb.sequence = buf->sequence;
++				buf->vb.field = V4L2_FIELD_NONE;
+ 				vb2_buffer_done(&buf->vb.vb2_buf,
+ 						VB2_BUF_STATE_DONE);
+ 			}
+@@ -1341,6 +1461,12 @@ int visp_buf_done(struct v4l2_subdev *sd, void *arg)
+ 	return 0;
+ }
+ 
++int visp_buf_done(struct v4l2_subdev *sd, void *arg)
++{
++	/* ts_ns == 0 means "stamp now" -- see visp_buf_done_ts(). */
++	return visp_buf_done_ts(sd, arg, 0);
++}
++
+ static int visp_queryctrl(struct v4l2_subdev *sd, void *arg)
+ {
+ 	int ret;
+@@ -1683,6 +1809,19 @@ static long visp_priv_ioctl(struct v4l2_subdev *sd, unsigned int cmd,
+ 	case VISP_GET_RPU_ID:
+ 		ret = visp_return_rpu_id(sd, arg);
+ 		break;
++	case VISP_IOC_EVENT_ACK: {
++		/*
++		 * Fast-path daemon ack: it already wrote event_pkg->ack=1
++		 * in shared memory; we just need to wake any visp_post_event
++		 * waiter. No payload, no return data.
++		 */
++		struct visp_dev *isp_dev = v4l2_get_subdevdata(sd);
++
++		if (isp_dev)
++			wake_up_all(&isp_dev->event_shm.wq_event_ack);
++		ret = 0;
++		break;
++	}
+ 	default:
+ 		break;
+ 	}
+@@ -2718,6 +2857,7 @@ static int visp_probe(struct platform_device *pdev)
+ 	isp_dev->event_shm.phy_addr =
+ 	    virt_to_phys(isp_dev->event_shm.virt_addr);
+ 	mutex_init(&isp_dev->event_shm.event_lock);
++	init_waitqueue_head(&isp_dev->event_shm.wq_event_ack);
+ 
+ 	isp_dev->reserve_mem.va =
+ 	    ioremap_wc(isp_dev->reserve_mem.pa, isp_dev->reserve_mem.size);
+diff --git a/visp/visp_driver.h b/visp/visp_driver.h
+index e606214..a4798e5 100644
+--- a/visp/visp_driver.h
++++ b/visp/visp_driver.h
+@@ -148,6 +148,14 @@ struct visp_event_shm {
+ 	uint64_t phy_addr;
+ 	void *virt_addr;
+ 	uint32_t size;
++	/*
++	 * Fast-path wakeup for visp_post_event(). The userspace daemon may
++	 * optionally call VISP_IOC_EVENT_ACK after writing event_pkg->ack,
++	 * which calls wake_up_all() on this waitqueue. Legacy daemons that
++	 * only write the shared-memory ack byte still work; the wait falls
++	 * back to short hrtimer-based re-polls.
++	 */
++	wait_queue_head_t wq_event_ack;
+ };
+ 
+ #define MAX_IBA_PER_ISP 5
+diff --git a/visp/visp_event.c b/visp/visp_event.c
+index 5de60ce..430818d 100644
+--- a/visp/visp_event.c
++++ b/visp/visp_event.c
+@@ -55,9 +55,46 @@
+ #include <media/v4l2-device.h>
+ #include <media/v4l2-event.h>
+ #include <linux/delay.h>
++#include <linux/hrtimer.h>
++#include <linux/jiffies.h>
++#include <linux/ktime.h>
++#include <linux/moduleparam.h>
++#include <linux/wait.h>
+ #include "visp_event.h"
+ #include "visp_driver.h"
+ 
++/*
++ * Upper bound (in milliseconds) on how long visp_post_event() will wait for
++ * the userspace daemon to acknowledge a posted event. Tunable at runtime:
++ *   echo 500 > /sys/module/visp/parameters/event_ack_timeout_ms
++ *
++ * The default has to cover the *slowest* event the daemon services, not the
++ * per-frame fast path. One-shot setup events (VISP_EVENT_LOAD_JSON,
++ * VISP_EVENT_LOAD_CALIB, VISP_EVENT_STREAMON) do file I/O and parse ISP
++ * configuration; on slow storage they can run well past a few hundred ms.
++ * 2 seconds is generous for those while still surfacing a genuinely stuck
++ * daemon quickly (the historical value was effectively infinite due to a
++ * counter-reset bug, which is what we are replacing).
++ *
++ * For the per-frame path, the daemon should call VISP_IOC_EVENT_ACK after
++ * writing event_pkg->ack -- that wakes the kernel immediately and the
++ * timeout never matters in steady state.
++ */
++static unsigned int visp_event_ack_timeout_ms = 2000;
++module_param_named(event_ack_timeout_ms, visp_event_ack_timeout_ms, uint, 0644);
++MODULE_PARM_DESC(event_ack_timeout_ms,
++	"Max milliseconds visp_post_event() will wait for the daemon ack (default 200)");
++
++/*
++ * Fallback re-poll interval used when the daemon ACKs via shared memory
++ * only (i.e. without calling VISP_IOC_EVENT_ACK). A modern daemon that
++ * issues the ioctl will wake immediately and never hit the timeout.
++ */
++static unsigned int visp_event_ack_poll_us = 1000; /* 1 ms */
++module_param_named(event_ack_poll_us, visp_event_ack_poll_us, uint, 0644);
++MODULE_PARM_DESC(event_ack_poll_us,
++	"Re-poll interval in microseconds for legacy ack-via-shared-memory daemons (default 1000)");
++
+ static bool visp_event_subscribed(struct v4l2_subdev *sd, uint32_t type,
+ 				  uint32_t id)
+ {
+@@ -87,9 +124,10 @@ static bool visp_event_subscribed(struct v4l2_subdev *sd, uint32_t type,
+ static int visp_post_event(struct v4l2_subdev *sd,
+ 			   struct visp_event_pkg *event_pkg)
+ {
++	struct visp_dev *isp_dev = v4l2_get_subdevdata(sd);
+ 	struct v4l2_event event;
+-	int timeout_ms = 6000000;
+-	int i = 0;
++	unsigned long deadline;
++	ktime_t poll_iv;
+ 
+ 	memset(&event, 0, sizeof(event));
+ 
+@@ -102,18 +140,35 @@ static int visp_post_event(struct v4l2_subdev *sd,
+ 		return -EPIPE;
+ 	}
+ 
++	/* Make sure the ack reset is published before the event. */
++	WRITE_ONCE(event_pkg->ack, 0);
++	smp_wmb();
++
+ 	v4l2_event_queue(sd->devnode, &event);
+ 
+-	for (i = 0; i < timeout_ms; i++) {
+-		if (event_pkg->ack)
+-			break;
+-		usleep_range(5, 10);
+-		if (i > 5000000)
+-			i = 0;
++	/*
++	 * Wait for the daemon to set event_pkg->ack.
++	 *
++	 * Fast path : daemon calls VISP_IOC_EVENT_ACK -> wakes wq_event_ack
++	 *             and the wait returns immediately.
++	 * Slow path : legacy daemon only writes the ack byte; we re-check
++	 *             every visp_event_ack_poll_us microseconds. Total wait
++	 *             is bounded by visp_event_ack_timeout_ms.
++	 */
++	deadline = jiffies + msecs_to_jiffies(visp_event_ack_timeout_ms);
++	poll_iv = ns_to_ktime((u64)visp_event_ack_poll_us * NSEC_PER_USEC);
++
++	while (!READ_ONCE(event_pkg->ack) &&
++	       time_before(jiffies, deadline)) {
++		(void)wait_event_hrtimeout(isp_dev->event_shm.wq_event_ack,
++					   READ_ONCE(event_pkg->ack) != 0,
++					   poll_iv);
+ 	}
+ 
+-	if (event_pkg->ack == 0) {
+-		dev_err(sd->dev, "post event %d time out\n", event.id);
++	if (!READ_ONCE(event_pkg->ack)) {
++		dev_err_ratelimited(sd->dev,
++			"post event %d timeout after %u ms\n",
++			event.id, visp_event_ack_timeout_ms);
+ 		return -EIO;
+ 	}
+ 
+diff --git a/visp/visp_event.h b/visp/visp_event.h
+index d2fe640..c586b9e 100644
+--- a/visp/visp_event.h
++++ b/visp/visp_event.h
+@@ -128,6 +128,15 @@ struct isp_rpu {
+ 
+ #define VISP_GET_RPU_ID _IOWR('I', BASE_VIDIOC_PRIVATE + 3, struct isp_rpu)
+ 
++/*
++ * Fast-path acknowledgement for an event previously posted via
++ * VISP_DEAMON_EVENT. The daemon should write event_pkg->ack=1 in the
++ * shared-memory page first, then call this ioctl with no payload to wake
++ * the kernel waiter immediately. Optional; if not called the kernel
++ * falls back to a short polled wait on the ack byte.
++ */
++#define VISP_IOC_EVENT_ACK _IO('I', BASE_VIDIOC_PRIVATE + 4)
++
+ #ifdef __KERNEL__
+ #include "visp_driver.h"
+ 
+diff --git a/visp_mbox/visp_mbox_driver.c b/visp_mbox/visp_mbox_driver.c
+index 23f39d6..c641b11 100644
+--- a/visp_mbox/visp_mbox_driver.c
++++ b/visp_mbox/visp_mbox_driver.c
+@@ -63,6 +63,21 @@ struct class *mailbox_class;
+ static DEFINE_MUTEX(rpu_list_lock);
+ static LIST_HEAD(rpu_devices);
+ 
++/*
++ * Bound on how long we wait for an APU<->RPU mailbox transaction to complete.
++ *
++ * Historically this site contained `msecs_to_jiffies(1000 * 60 * 5)` with two
++ * contradictory comments ("5 seconds" vs "5 minutes"). The value evaluates to
++ * five MINUTES, which is far too long for anything on the per-frame path: a
++ * single stuck firmware transaction stalls the pipeline for up to 5 min and
++ * produces large outliers in measured FPS.
++ *
++ * TODO(perf): reduce this to a value derived from the worst-case expected
++ * firmware response (e.g. 2-3 frame periods, or a few hundred ms). Confirm
++ * with firmware team before reducing in production.
++ */
++#define VISP_MBOX_ACK_TIMEOUT_MS	(10U * 60U * 1000U)
++
+ typedef int (*frameout_cb_t)(struct visp_dev *dev);
+ 
+ static void visp_mbox_event_notified(unsigned long data)
+@@ -440,15 +455,14 @@ uint8_t xlnx_mbox_apu_wait_for_data(struct visp_dev *isp_dev, void *data)
+ 		goto ERROR;
+ 	}
+ 
+-	long timeout_jiffies =
+-	    msecs_to_jiffies(1000 * 60 * 5); // Timeout of 5000ms (5 seconds)
++	long timeout_jiffies = msecs_to_jiffies(VISP_MBOX_ACK_TIMEOUT_MS);
+ 	/*
+ 	 * Use the non-interruptible variant on purpose: this wait runs in
+ 	 * a syscall context that has already pushed a command into the
+ 	 * APU->RPU mailbox.  If a userspace SIGINT (Ctrl-C) aborted the
+ 	 * wait we would unwind while the RPU is still mid-transaction,
+ 	 * leaving the mailbox FIFO and the RPU's view of the camera/sensor
+-	 * state desynchronized.  The 5-minute timeout still bounds the wait.
++	 * state desynchronized.  The 5-second timeout still bounds the wait.
+ 	 */
+ 	result = wait_for_completion_timeout(
+ 	    &isp_dev->apu_wait_for_data, timeout_jiffies);
+@@ -647,14 +661,13 @@ uint8_t xlnx_mbox_apu_wait_for_ack(struct visp_dev *isp_dev)
+ 	}
+ 
+ 	/* Wait for acknowledgment completion */
+-	long timeout_jiffies =
+-	    msecs_to_jiffies(1000 * 60 * 5); // Timeout of 5000ms (5 seconds)
++	long timeout_jiffies = msecs_to_jiffies(VISP_MBOX_ACK_TIMEOUT_MS);
+ 	/*
+ 	 * Non-interruptible on purpose -- see xlnx_mbox_apu_wait_for_data().
+ 	 * A SIGINT here would abandon an outstanding APU->RPU command and
+ 	 * desync the mailbox / RPU state machine, which then breaks every
+-	 * subsequent stream-on attempt.  The 5-minute timeout still bounds
+-	 * the wait.
++	 * subsequent stream-on attempt.  VISP_MBOX_ACK_TIMEOUT_MS bounds the
++	 * wait.
+ 	 */
+ 	result = wait_for_completion_timeout(
+ 	    &isp_dev->apu_wait_for_ack, timeout_jiffies);
+diff --git a/visp_video/visp_video_register.h b/visp_video/visp_video_register.h
+old mode 100755
+new mode 100644

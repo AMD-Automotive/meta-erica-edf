@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+Copyright © Advanced Micro Devices, Inc., or its affiliates. All rights reserved.
+SPDX-License-Identifier: MIT
+Contributors: KC
+Maintainer: KC
+
+Camera pipeline composition for the AMD video_config tool. The Xylon register
+tables it references carry their own BSD-3-Clause notice.
+-->
+<Config>
+    <Board name="FMC_GMSL2" type="BoardFmcGmsl2" i2cdev="/dev/i2c-0">
+        <Device name="Deser1" type="Deser_MAX9296" i2caddr="0x4E">
+            <Configuration type="inifile" conf="deser.ini">
+                <Variables>
+                    <DESERIALIZER>0x4E</DESERIALIZER>
+                </Variables>
+            </Configuration>
+            <Device name="CAM0" type="logiCAM_GMSL2_AR023">
+                <Configuration type="inifile" conf="linkA.ini">
+                    <Variables>
+                        <SER_FPGA_LOG>0x88</SER_FPGA_LOG>
+                    </Variables>
+                </Configuration>
+            </Device>
+            <Device name="CAM1" type="logiCAM_GMSL2_AR023">
+                <Configuration type="inifile" conf="linkB.ini">
+                    <Variables>
+                        <SER_FPGA_LOG>0x88</SER_FPGA_LOG>
+                    </Variables>
+                </Configuration>
+            </Device>
+	    <Device name="CAM2" type="logiCAM_GMSL2_AR023">
+                <Configuration type="inifile" conf="linkC.ini">
+                    <Variables>
+                        <SER_FPGA_LOG>0x88</SER_FPGA_LOG>
+                    </Variables>
+                </Configuration>
+            </Device>
+            <Device name="CAM3" type="logiCAM_GMSL2_AR023">
+                <Configuration type="inifile" conf="linkD.ini">
+                    <Variables>
+                        <SER_FPGA_LOG>0x88</SER_FPGA_LOG>
+                    </Variables>
+                </Configuration>
+	    </Device>
+        </Device>
+    </Board>
+</Config>
+
